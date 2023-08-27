@@ -706,8 +706,8 @@ void VR::on_lua_state_created(sol::state& lua) {
         "get_action_dpad_left", &VR::get_action_dpad_left,
         "get_action_dpad_right", &VR::get_action_dpad_right,
         "get_action_heal", &VR::get_action_heal,
-        "get_left_joystick", &VR::get_left_joystick,
-        "get_right_joystick", &VR::get_right_joystick,
+        "get_left_joystick", &VR::get_right_joystick,
+        "get_right_joystick", &VR::get_left_joystick,
         "is_using_controllers", &VR::is_using_controllers,
         "is_openvr_loaded", &VR::is_openvr_loaded,
         "is_openxr_loaded", &VR::is_openxr_loaded,
@@ -3431,7 +3431,7 @@ void VR::openvr_input_to_re2_re3(REManagedObject* input_system) {
     set_button_state(app::ropeway::InputDefine::Kind::DEFENSE, is_left_trigger_down);
 
     // L3: Sprint
-    set_button_state(app::ropeway::InputDefine::Kind::JOG1, is_left_joystick_click_down);
+    set_button_state(app::ropeway::InputDefine::Kind::JOG1, is_right_joystick_click_down);
 
     // R3: Reset camera
     set_button_state(app::ropeway::InputDefine::Kind::RESET_CAMERA, is_reset_view_down);
@@ -4075,11 +4075,11 @@ Vector2f VR::get_joystick_axis(vr::VRInputValueHandle_t handle) const {
 }
 
 Vector2f VR::get_left_stick_axis() const {
-    return get_joystick_axis(m_left_joystick);
+    return get_joystick_axis(m_right_joystick);
 }
 
 Vector2f VR::get_right_stick_axis() const {
-    return get_joystick_axis(m_right_joystick);
+    return get_joystick_axis(m_left_joystick);
 }
 
 void VR::trigger_haptic_vibration(float seconds_from_now, float duration, float frequency, float amplitude, vr::VRInputValueHandle_t source) {
