@@ -406,11 +406,11 @@ XrPath OpenXR::get_current_interaction_profile_path() const {
 std::optional<std::string> OpenXR::initialize_actions(const std::string& json_string) {
     spdlog::info("[VR] Initializing actions");
 
-    if (auto result = xrStringToPath(this->instance, "/user/hand/left", &this->hands[VRRuntime::Hand::LEFT].path); result != XR_SUCCESS) {
+    if (auto result = xrStringToPath(this->instance, "/user/hand/left", &this->hands[VRRuntime::Hand::RIGHT].path); result != XR_SUCCESS) {
         return "xrStringToPath failed (left): " + this->get_result_string(result);
     }
 
-    if (auto result = xrStringToPath(this->instance, "/user/hand/right", &this->hands[VRRuntime::Hand::RIGHT].path); result != XR_SUCCESS) {
+    if (auto result = xrStringToPath(this->instance, "/user/hand/right", &this->hands[VRRuntime::Hand::LEFT].path); result != XR_SUCCESS) {
         return "xrStringToPath failed (right): " + this->get_result_string(result);
     }
 

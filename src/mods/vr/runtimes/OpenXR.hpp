@@ -229,18 +229,18 @@ public:
         {"/user/hand/*/output/haptic", "haptic"}, // most of them
 
         {"/user/hand/right/input/a/click", "re3_dodge"},
-        {"/user/hand/left/input/trigger", "weapondial_start"},
+        {"/user/hand/right/input/trigger", "weapondial_start"},
     };
 
     static inline std::vector<ActionVectorAssociation> s_action_vector_associations {
         { 
-            VRRuntime::Hand::LEFT, "touchpad", "touchpadclick", {
+            VRRuntime::Hand::RIGHT, "touchpad", "touchpadclick", {
             { {0.0, -1.0f}, "abutton" },
             { {1.0f, 0.0f}, "bbutton" },
             { {0.0f, 1.0f}, "joystickclick" }
         }},
         { 
-            VRRuntime::Hand::RIGHT, "touchpad", "touchpadclick", {
+            VRRuntime::Hand::LEFT, "touchpad", "touchpadclick", {
             { {0.0, -1.0f}, "abutton" },
             { {-1.0f, 0.0f}, "bbutton" },
             { {0.0f, 1.0f}, "joystickclick" }

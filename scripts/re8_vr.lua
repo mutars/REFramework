@@ -18,9 +18,9 @@ local renderer_type = sdk.find_type_definition("via.render.Renderer")
 local GamePadButton = statics.generate("via.hid.GamePadButton")
 
 local openxr = {
-    left_hand_rotation_vec = Vector3f.new(0.186417 + 0.2, 2.820591, 1.221779), -- pitch yaw roll?
-    right_hand_rotation_vec = Vector3f.new(0.186417, -2.820591, -1.221779), -- pitch yaw roll?
-    left_hand_position_offset = Vector4f.new(-0.036934, 0.069525, 0.017501, 0.0),
+    left_hand_rotation_vec = Vector3f.new(0.186417 , 2.820591, 1.221779), -- pitch yaw roll?
+    right_hand_rotation_vec = Vector3f.new(0.186417 - 0.3, -2.820591-0.1, -1.221779-0.1), -- pitch yaw roll?
+    left_hand_position_offset = Vector4f.new(0.036934, 0.069525, 0.017501, 0.0),
     right_hand_position_offset = Vector4f.new(0.036934, 0.069525, 0.017501, 0.0)
 }
 
