@@ -147,7 +147,7 @@ void FirstPerson::on_draw_ui() {
 
         if (!is_left_trigger_active) {
             if (!is_left_grip_active) {
-                m_left_hand_rotation_offset.x = m_left_hand_rotation_offset.x + (left_axis.y * 0.001);
+                // m_left_hand_rotation_offset.x = m_left_hand_rotation_offset.x + (left_axis.y * 0.001);
                 m_left_hand_rotation_offset.y = m_left_hand_rotation_offset.y + (left_axis.x * 0.001);
             } else {
                 m_left_hand_rotation_offset.z = m_left_hand_rotation_offset.z + ((left_axis.y + left_axis.x) * 0.001);
@@ -231,7 +231,11 @@ void FirstPerson::on_lua_state_created(sol::state& state) {
         "new", sol::no_constructor,
         "is_enabled", &FirstPerson::is_enabled,
         "will_be_used", &FirstPerson::will_be_used,
-        "on_pre_flashlight_apply_transform", &FirstPerson::on_pre_flashlight_apply_transform
+        "on_pre_flashlight_apply_transform", &FirstPerson::on_pre_flashlight_apply_transform,
+        "left_hand_position_offset", &FirstPerson::m_left_hand_position_offset,
+        "right_hand_position_offset", &FirstPerson::m_right_hand_position_offset,
+        "left_hand_rotation_offset", &FirstPerson::m_left_hand_rotation_offset,
+        "right_hand_rotation_offset", &FirstPerson::m_right_hand_rotation_offset
     );
 
     state["firstpersonmod"] = this;
