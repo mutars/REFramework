@@ -423,7 +423,63 @@ void IntegrityCheckBypass::immediate_patch_re4() {
     const auto conditional_jmp_block = utility::scan(game, "48 8B 8D D0 03 00 00 48 29 C1 75 ?");
 
     if (!conditional_jmp_block) {
-        spdlog::error("[IntegrityCheckBypass]: Could not find conditional_jmp!");
+        spdlog::error("[IntegrityCheckBypass]: Could not find conditional_jmp, trying fallback.");
+
+        // mov     [rbp+192h], al
+        // this is used shortly after the conditional jmp, only place that uses it.
+        const auto unique_instruction = utility::scan(game, "88 85 92 01 00 00");
+
+        if (!unique_instruction) {
+            spdlog::error("[IntegrityCheckBypass]: Could not find unique_instruction!");
+            return;
+        }
+
+        // Conditional jmp is very close to the instruction, before it.
+        // However, this specific block of instructions is used all over the place
+        // so we have to use the unique instruction is a reference point to scan from.
+        const auto short_jmp_before = utility::scan_reverse(*unique_instruction, 0x100, "75 ? 50 F7 D0");
+
+        if (short_jmp_before) {
+            static auto patch = Patch::create(*short_jmp_before, { 0xEB }, true);
+            spdlog::info("[IntegrityCheckBypass]: Patched conditional_jmp!");
+            return;
+        }
+
+        // If we've gotten to this point, we are trying the scorched earth method of trying to obtain the function "start"
+        // for this giant obfuscated blob. We will get the instructions behind the unique_instruction we found by doing that,
+        // and look for the nearest branch instruction to patch.
+        spdlog::error("[IntegrityCheckBypass]: Could not find short_jmp_before, trying fallback.");
+
+        // Get the preceding instructions. If this doesn't work we'll need to scan for a common instruction anchor to scan forward from...
+        auto previous_instructions = utility::get_disassembly_behind(*unique_instruction);
+
+        if (previous_instructions.empty()) {
+            spdlog::error("[IntegrityCheckBypass]: Could not find previous_instructions!");
+            return;
+        }
+
+        // Reverse the order of the instructions.
+        std::reverse(previous_instructions.begin(), previous_instructions.end());
+
+        spdlog::info("[IntegrityCheckBypass]: Found {} previous instructions.", previous_instructions.size());
+        spdlog::info("[IntegrityCheckBypass]: Walking previous instructions...");
+
+        for (auto& insn : previous_instructions) {
+            if (insn.instrux.BranchInfo.IsBranch) {
+                spdlog::info("[IntegrityCheckBypass]: Found branch instruction, patching...");
+                
+                if (insn.instrux.BranchInfo.IsFar) {
+                    static auto patch = Patch::create(insn.addr, { 0xE9 }, true);
+                } else {
+                    static auto patch = Patch::create(insn.addr, { 0xEB }, true);
+                }
+
+                spdlog::info("[IntegrityCheckBypass]: Patched conditional_jmp");
+                return;
+            }
+        }
+        
+        spdlog::error("[IntegrityCheckBypass]: Could not find branch instruction to patch!");
         return;
     }
 
