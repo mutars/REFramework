@@ -98,6 +98,8 @@ public:
         return "mhrise";
     #elif defined(SF6)
         return "sf6";
+    #elif defined(DD2)
+        return "dd2";
     #else
         return "unknown";
     #endif
@@ -147,11 +149,14 @@ private:
     bool initialize_game_data();
     bool initialize_windows_message_hook();
 
+    bool first_frame_initialize();
+
     void call_on_frame();
 
     HMODULE m_reframework_module{};
 
     bool m_first_frame{true};
+    bool m_first_frame_d3d_initialize{true};
     bool m_is_d3d12{false};
     bool m_is_d3d11{false};
     bool m_valid{false};
@@ -160,6 +165,7 @@ private:
     bool m_started_game_data_thread{false};
     std::atomic<bool> m_terminating{false}; // Destructor is called
     std::atomic<bool> m_game_data_initialized{false};
+    std::atomic<bool> m_mods_fully_initialized{false};
     
     // UI
     bool m_has_frame{false};
@@ -265,7 +271,6 @@ private: // D3D12 members
             BACKBUFFER_0,
             BACKBUFFER_1,
             BACKBUFFER_2,
-            BACKBUFFER_3,
             IMGUI,
             BLANK,
             COUNT,
