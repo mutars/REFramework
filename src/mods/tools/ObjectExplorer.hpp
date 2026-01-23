@@ -144,7 +144,7 @@ private:
     std::string generate_full_name(sdk::RETypeDB* tdb, uint32_t i);
     void export_deserializer_chain(nlohmann::json& il2cpp_dump, sdk::RETypeDB* tdb, REType* t, std::optional<std::string> real_name = std::nullopt);
 #endif
-    void generate_sdk();
+    void generate_sdk(bool skip_sdkgenny);
     void report_sdk_dump_progress(float progress);
 
     void handle_game_object(REGameObject* game_object);
@@ -161,13 +161,14 @@ private:
     void display_reflection_properties(REManagedObject* obj, REType* type_info);
     void display_native_methods(REManagedObject* obj, sdk::RETypeDefinition* tdef);
     void display_native_fields(REManagedObject* obj, sdk::RETypeDefinition* tdef);
+    void populate_method_meta_info(sdk::REMethodDefinition& m);
     void attempt_display_method(REManagedObject* obj, sdk::REMethodDefinition& m, bool use_full_name = false);
     void attempt_display_field(REManagedObject* obj, VariableDescriptor* desc, REType* type_info);
     void display_data(void* data, void* real_data, std::string type_name, bool is_enum = false, bool managed_str = false, const sdk::RETypeDefinition* override_def = nullptr);
     int32_t get_field_offset(REManagedObject* obj, VariableDescriptor* desc, REType* type_info);
 
-    bool widget_with_context(void* address, std::function<bool()> widget);
-    bool widget_with_context(void* address, const std::string& name, std::function<bool()> widget);
+    bool widget_with_context(void* address, std::function<bool()> widget, std::optional<std::function<void()>> additional_context = std::nullopt);
+    bool widget_with_context(void* address, const std::string& name, std::function<bool()> widget, std::optional<std::function<void()>> additional_context = std::nullopt);
     void context_menu(void* address, std::optional<std::string> name = std::nullopt, std::optional<std::function<void()>> additional_context = std::nullopt);
     void hook_method(sdk::REMethodDefinition* method, std::optional<std::string> name);
     void hook_all_methods(sdk::RETypeDefinition* type);
@@ -180,6 +181,7 @@ private:
     void populate_classes();
     void populate_enums();
     void init();
+    void install_veh();
 
     std::string get_full_enum_value_name(std::string_view enum_name, int64_t value);
     std::string get_enum_value_name(std::string_view enum_name, int64_t value);
@@ -217,8 +219,12 @@ private:
         return path;
     }
 
+    sdk::REMethodDefinition* locate_nearest_method(uintptr_t instruction);
     HookManager::PreHookResult pre_hooked_method_internal(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr, sdk::REMethodDefinition* method);
     static HookManager::PreHookResult pre_hooked_method(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr, sdk::REMethodDefinition* method);
+
+    void post_hooked_method_internal(uintptr_t& ret_val, sdk::RETypeDefinition*& ret_ty, uintptr_t ret_addr, sdk::REMethodDefinition* method);
+    static void post_hooked_method(uintptr_t& ret_val, sdk::RETypeDefinition*& ret_ty, uintptr_t ret_addr, sdk::REMethodDefinition* method);
 
     struct PinnedObject {
         Address address{};
@@ -226,27 +232,93 @@ private:
         std::string path{};
     };
 
-    std::recursive_mutex m_hooked_methods_mtx{};
+    struct HooksContext {
+        enum class SortMethod : uint8_t {
+            NONE,
+            CALL_COUNT,
+            CALL_TIME_LAST,
+            CALL_TIME_DELTA,
+            CALL_TIME_TOTAL,
+            METHOD_NAME,
+            NUMBER_OF_CALLERS,
+            NUMBER_OF_THREADS_CALLED_FROM
+        };
+
+        static inline constexpr std::array<const char*, 8> s_sort_method_names {
+            "None",
+            "Call Count",
+            "Call Time (Last)",
+            "Call Time (Delta)",
+            "Call Time (Total)",
+            "Method Name",
+            "Number of Callers",
+            "Number of Threads Called From"
+        };
+
+        std::recursive_mutex mtx{};
+        bool hide_uncalled_methods{false};
+        SortMethod sort_method{SortMethod::NONE};
+    } m_hooks_context{};
+
     std::recursive_mutex m_job_mutex{};
     std::vector<std::function<void()>> m_frame_jobs{};
 
     struct HookedMethod {
+        enum class SortCallersMethod : uint8_t {
+            NONE,
+            CALL_COUNT,
+            METHOD_NAME
+        };
+    
+        static inline constexpr std::array<const char*, 3> s_sort_callers_names {
+            "None",
+            "Call Count",
+            "Method Name"
+        };
+
         std::string name{};
         sdk::REMethodDefinition* method{nullptr};
         uintptr_t jitted_function{};
+        uintptr_t jitted_function_post{};
         bool skip{false};
         size_t hook_id{};
-        uint32_t call_count{};
+        SortCallersMethod sort_callers_method{SortCallersMethod::NONE};
 
+        // Not considered stats because resetting these causes large fluctuations in the stats
         std::unordered_set<uintptr_t> return_addresses{};
-        std::unordered_map<uintptr_t, sdk::REMethodDefinition*> return_addresses_to_methods{};
         std::unordered_set<sdk::REMethodDefinition*> callers{};
-        struct CallerContext {
-            size_t call_count{};
-        };
+        std::unordered_map<uintptr_t, sdk::REMethodDefinition*> return_addresses_to_methods{};
+        std::unique_ptr<std::recursive_mutex> mtx{std::make_unique<std::recursive_mutex>()};
 
-        std::unordered_map<sdk::REMethodDefinition*, CallerContext> callers_context{};
+        struct Stats {
+            uint32_t call_count{};
+            std::unordered_set<uint32_t> thread_ids{};
+            struct CallerContext {
+                size_t call_count{};
+            };
+
+
+            using tp = std::chrono::high_resolution_clock::time_point;
+            std::unordered_map<sdk::REMethodDefinition*, CallerContext> callers_context{};
+            std::chrono::high_resolution_clock::time_point last_call_time{std::chrono::high_resolution_clock::now()};
+            std::unordered_map<std::thread::id, tp> last_call_times{};
+            std::chrono::high_resolution_clock::time_point last_call_end_time{std::chrono::high_resolution_clock::now()}; // assuming not recursive...
+            std::chrono::high_resolution_clock::duration last_call_delta{};
+            std::chrono::high_resolution_clock::duration total_call_time{};
+        } stats;
+
+        void reset_stats() {
+            stats = Stats{};
+        }
     };
+
+    // Contains extra information about the method
+    struct MethodMetaInfo {
+        std::vector<sdk::REMethodDefinition*> called_functions{};
+    };
+
+    // Function address -> meta info (not REMethodDefinition, since method defs can share function addresses)
+    std::unordered_map<uintptr_t, std::unique_ptr<MethodMetaInfo>> m_method_meta_infos{};
 
     asmjit::JitRuntime m_jit_runtime;
 
@@ -262,6 +334,7 @@ private:
     std::string m_type_member{""};
     std::string m_type_field{""};
     std::string m_method_address{ "0" };
+    std::string m_method_tdb_address{ "0" };
     std::string m_object_address{ "0" };
     std::string m_add_component_name{ "via.Component" };
     std::chrono::system_clock::time_point m_next_refresh;
@@ -289,6 +362,108 @@ private:
     sdk::REMethodDefinition* m_displayed_method{nullptr};
 
     std::vector<uint8_t> m_module_chunk{};
+
+    struct VEHState {
+        enum BreakpointMethod {
+            HARDWARE,
+            GUARD_PAGE,
+        };
+        BreakpointMethod breakpoint_method{HARDWARE};
+
+        HANDLE veh_handle{};
+        std::shared_mutex mtx{};
+        std::shared_mutex guard_page_mtx{};
+        std::shared_mutex single_step_mtx{};
+
+        struct Listener {
+            uintptr_t address{};
+            sdk::REField* field{};
+            size_t hits{};
+            std::unordered_set<uintptr_t> instructions{};
+        };
+
+        std::shared_mutex listener_mtx{};
+        std::unordered_map<uintptr_t, std::unique_ptr<Listener>> read_listeners{};
+        std::unordered_map<uintptr_t, std::unique_ptr<Listener>> write_listeners{};
+
+        struct GuardedPage {
+            DWORD old_protect{};
+            MEMORY_BASIC_INFORMATION mbi{};
+            size_t num_references{};
+        };
+
+        std::vector<std::shared_ptr<GuardedPage>> guarded_pages{};
+        std::unordered_map<uint32_t, std::shared_ptr<GuardedPage>> single_step_pages{};
+
+        struct HardwareBreakpoint {
+            uintptr_t address{};
+            size_t debug_register{}; // DR0 - DR3
+            bool read{};
+            bool write{};
+        };
+
+        std::shared_mutex hardware_breakpoint_mtx{};
+        std::unordered_map<uintptr_t, std::shared_ptr<HardwareBreakpoint>> hardware_breakpoints{};
+
+        std::shared_ptr<GuardedPage> pop_single_step_thread(uint32_t thread_id) {
+            std::unique_lock _(single_step_mtx);
+            if (auto it = single_step_pages.find(thread_id); it != single_step_pages.end()) {
+                auto page = it->second;
+                single_step_pages.erase(it);
+                return page;
+            }
+
+            return nullptr;
+        }
+
+        bool is_address_listening_unsafe(uintptr_t address) {
+            return read_listeners.contains(address) || write_listeners.contains(address);
+        }
+
+        bool is_address_listening(uintptr_t address) {
+            std::shared_lock lock(mtx);
+            return is_address_listening_unsafe(address);
+        }
+
+        std::shared_ptr<GuardedPage> get_guarded_page_unsafe(uintptr_t address) {
+            for (auto& page : guarded_pages) {
+                if (address >= (uintptr_t)page->mbi.BaseAddress && address < (uintptr_t)page->mbi.BaseAddress + page->mbi.RegionSize) {
+                    return page;
+                }
+            }
+
+            return nullptr;
+        }
+
+        std::shared_ptr<GuardedPage> get_guarded_page(uintptr_t address) {
+            std::shared_lock _{ guard_page_mtx };
+            return get_guarded_page_unsafe(address);
+        }
+
+        std::shared_ptr<HardwareBreakpoint> get_hardware_breakpoint_unsafe(uintptr_t address) {
+            if (auto it = hardware_breakpoints.find(address); it != hardware_breakpoints.end()) {
+                return it->second;
+            }
+
+            return nullptr;
+        }
+
+        std::shared_ptr<HardwareBreakpoint> get_hardware_breakpoint(uintptr_t address) {
+            std::shared_lock _{ hardware_breakpoint_mtx };
+            return get_hardware_breakpoint_unsafe(address);
+        }
+
+        void set_guard_page_protections(uintptr_t address);
+        void set_hardware_breakpoint(uintptr_t address, bool read, bool write);
+        void clear_all_hardware_breakpoints();
+        void add_read_listener(uintptr_t address, sdk::REField* field);
+        void remove_read_listener(uintptr_t address);
+        void display_listeners();
+    } m_veh_state{};
+
+    LONG exception_handler_veh_internal(_EXCEPTION_POINTERS* ei);
+    static LONG exception_handler_veh(_EXCEPTION_POINTERS* ei);
+    bool m_veh_installed{ false };
 
     bool m_do_init{ true };
 

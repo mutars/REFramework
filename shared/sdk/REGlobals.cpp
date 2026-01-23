@@ -27,11 +27,16 @@ REGlobals::REGlobals() {
     auto start = (uintptr_t)mod;
     auto end = (uintptr_t)start + *utility::get_module_size(mod);
 
+    end -= 0x1000;
+
+    spdlog::info("start: {:x}", start);
+    spdlog::info("end: {:x}", end);
+
     // generic pattern used for all these globals
     auto pat = std::string{ "48 8D ? ? ? ? ? 48 B8 00 00 00 00 00 00 00 80" };
 
     // find all the globals
-    for (auto i = utility::scan(start, end - start, pat); i.has_value(); i = utility::scan(*i + 1, end - (*i + 1), pat)) {
+    for (auto i = utility::scan(start, end - start, pat); i.has_value(); i = utility::scan(*i + 1, end - (*i + 1), pat)) try {
         auto ptr = utility::calculate_absolute(*i + 3);
 
         // Make sure the global is within the module boundaries
@@ -55,7 +60,9 @@ REGlobals::REGlobals() {
         }
         
         m_objects.insert(obj_ptr);
-        m_object_list.push_back(obj_ptr);
+        m_object_list.insert(obj_ptr);
+    } catch(...) {
+        
     }
 
     // Create a list of getter functions instead
@@ -64,6 +71,8 @@ REGlobals::REGlobals() {
 
         auto& types = reframework::get_types();
         auto& type_list = types->get_types();
+
+        size_t i = 0;
 
         for (auto t : type_list) {
             auto name = std::string{t->name};
@@ -91,7 +100,9 @@ REGlobals::REGlobals() {
                 // Get the contained type by grabbing the string between the "`1<"" and the ">""
                 auto type_name = name.substr(name.find("`1<") + 3, name.find(">") - name.find("`1<") - 3);
 
-                spdlog::info("{}", type_name);
+                if (i++ < 100) {
+                    spdlog::info("{}", type_name);
+                }
 
                 m_getters[type_name] = getter;
             }
@@ -104,13 +115,13 @@ REGlobals::REGlobals() {
     spdlog::info("Finished REGlobals initialization");
 }
 
-std::vector<REManagedObject*> REGlobals::get_objects() {
-    std::vector<REManagedObject*> out{};
+std::unordered_set<REManagedObject*> REGlobals::get_objects() {
+    std::unordered_set<REManagedObject*> out{};
 
     if (!m_object_list.empty()) {
         for (auto obj_ptr : m_object_list) {
             if (*obj_ptr != nullptr && !IsBadReadPtr(*obj_ptr, sizeof(void*))) {
-                out.push_back(*obj_ptr);
+                out.insert(*obj_ptr);
             }
         }
     } else {
@@ -118,7 +129,7 @@ std::vector<REManagedObject*> REGlobals::get_objects() {
             auto result = getter.second();
 
             if (result != nullptr) {
-                out.push_back(result);
+                out.insert(result);
             }
         }
     }

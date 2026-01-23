@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <deque>
 #include <shared_mutex>
 
 #include <Windows.h>
@@ -50,6 +51,9 @@ namespace sdk {
 class REMethodDefinition;
 class RETypeDefinition;
 class REField;
+
+struct Delegate;
+struct DelegateInvocation;
 }
 
 class REManagedObject;
@@ -95,7 +99,7 @@ int sol_lua_push(sol::types<T*>, lua_State* l, T* obj);
 template<detail::CachedUserType T>
 int sol_lua_push(sol::types<T*>, lua_State* l, T* obj);
 
-class ScriptState {
+class ScriptState : public std::enable_shared_from_this<ScriptState> {
 public:
     enum class GarbageCollectionHandler : uint32_t {
         REFRAMEWORK_MANAGED = 0,
@@ -133,6 +137,7 @@ public:
 
     void on_frame();
     void on_draw_ui();
+    void on_update_transform(RETransform* transform);
     void on_pre_application_entry(size_t hash);
     void on_application_entry(size_t hash);
     bool on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context);
@@ -148,14 +153,125 @@ public:
     // add_hook enqueues the hook definition to be installed the next time install_hooks is called.
     void add_hook(sdk::REMethodDefinition* fn, sol::protected_function pre_cb, sol::protected_function post_cb, sol::object ignore_jmp_obj);
     void add_vtable(::REManagedObject* obj, sdk::REMethodDefinition* fn, sol::protected_function pre_cb, sol::protected_function post_cb);
+    void add_update_transform(RETransform* transform, sol::protected_function fn);
 
     // install_hooks goes through the queue of added hooks and actually creates them. The queue is emptied as a result.
     void install_hooks();
 
     void gc_data_changed(GarbageCollectionData data);
 
+    void push_hook_storage(size_t thread_hash) {
+        auto it = m_hook_storage.find(thread_hash);
+        if (it == m_hook_storage.end()) {
+            it = m_hook_storage.emplace(thread_hash, std::list<TablePool::TableGuard>{}).first;
+        }
+
+        it->second.push_back(m_table_pool.acquire(m_lua));
+        m_current_hook_storage = it->second.back();
+    }
+
+    void pop_hook_storage(size_t thread_hash) {
+        auto it = m_hook_storage.find(thread_hash);
+        if (it != m_hook_storage.end()) {
+            if (!it->second.empty()) {
+                it->second.pop_back();
+            }
+        }
+
+        m_current_hook_storage = sol::nil;
+    }
+
+    sol::reference get_hook_storage() {
+        return m_current_hook_storage;
+    }
+    
+    class TablePool {
+    public:
+        class TableGuard {
+        public:
+            TableGuard(TablePool& pool, sol::table& table) 
+                : m_pool{pool},
+                m_table{table} 
+            {
+            
+            }
+
+            TableGuard(TableGuard&& other) noexcept
+                : m_pool{other.m_pool},
+                m_table{other.m_table}
+            {
+                other.m_table = sol::nil;
+                other.m_moved = true;
+            }
+            
+            TableGuard& operator=(TableGuard&& other) noexcept {
+                m_pool = other.m_pool;
+                m_table = other.m_table;
+                other.m_table = sol::nil;
+                other.m_moved = true;
+                return *this;
+            }
+
+            TableGuard(const TableGuard&) = delete;
+            TableGuard& operator=(const TableGuard&) = delete;
+
+            ~TableGuard() {
+                if (m_moved) {
+                    return;
+                }
+
+                m_pool.m_tables.push_back(m_table);
+            }
+            
+            operator sol::table&() { return m_table; }
+            sol::table get() { return m_table; }
+
+        private:
+            TablePool& m_pool;
+            sol::table m_table;
+            bool m_moved{false};
+        };
+
+        TableGuard acquire(sol::state_view lua) {
+            if (m_tables.empty()) {
+                m_tables.push_back(lua.create_table());
+            }
+
+            auto table = m_tables.front();
+            m_tables.pop_front();
+
+            // Clear for re-use
+            table.clear();
+
+            return TableGuard{*this, table};
+        }
+
+    private:
+        std::list<sol::table> m_tables{};
+    };
+
+    TablePool& get_table_pool() {
+        return m_table_pool;
+    }
+
+    void add_delegate_callback(sdk::DelegateInvocation& invo, sol::protected_function callback);
+
 private:
+    sol::reference get_hook_storage_internal(size_t thread_hash) {
+        //return m_current_hook_storage;
+
+        auto it = m_hook_storage.find(thread_hash);
+        if (it != m_hook_storage.end()) {
+            if (!it->second.empty()) {
+                return it->second.back();
+            }
+        }
+
+        return sol::nil;
+    }
+
     sol::state m_lua{};
+    TablePool m_table_pool{};
 
     GarbageCollectionData m_gc_data{};
     bool m_is_main_state;
@@ -164,6 +280,8 @@ private:
     // FNV-1A
     std::unordered_multimap<size_t, sol::protected_function> m_pre_application_entry_fns{};
     std::unordered_multimap<size_t, sol::protected_function> m_application_entry_fns{};
+
+    std::unordered_map<RETransform*, sol::protected_function> m_on_update_transform_fns{};
 
     std::vector<sol::protected_function> m_pre_gui_draw_element_fns{};
     std::vector<sol::protected_function> m_gui_draw_element_fns{};
@@ -182,6 +300,22 @@ private:
 
     std::deque<HookDef> m_hooks_to_add{};
     std::unordered_map<sdk::REMethodDefinition*, std::vector<HookManager::HookId>> m_hooks{};
+
+    // Using std::list rather than deque because the elements need to remain valid even if the list is resized.
+    // Using sol::reference instead of sol::table to keep a guaranteed reference to the table.
+    std::unordered_map<size_t, std::list<TablePool::TableGuard>> m_hook_storage{};
+    sol::reference m_current_hook_storage{};
+
+    struct DelegateStorage {
+        std::weak_ptr<ScriptState> owner{}; // Weak pointer to the ScriptState that owns this delegate storage because the ScriptState may be deleted. 
+        std::vector<sol::protected_function> callbacks{};
+
+    };
+
+    static inline std::unordered_map<REManagedObject*, std::unique_ptr<DelegateStorage>> s_delegates{};
+    static inline std::recursive_mutex s_delegates_mutex{};
+
+    static void delegate_callback(sdk::VMContext* ctx, REManagedObject* obj);
 };
 
 class ScriptRunner : public Mod {
@@ -208,6 +342,7 @@ public:
     }
     void on_frame() override;
     void on_draw_ui() override;
+    void on_update_transform(RETransform* transform) override;
     void on_pre_application_entry(void* entry, const char* name, size_t hash) override;
     void on_application_entry(void* entry, const char* name, size_t hash) override;
     bool on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) override;
@@ -217,10 +352,6 @@ public:
 
     const auto& get_state() {
         return m_main_state;
-    }
-    //not sure how to approach this, should there be error checking here?
-    const auto& get_state(int index) { 
-        return m_states[index];
     }
 
     void lock() {
@@ -259,6 +390,10 @@ public:
         m_states_to_delete.push_back(lua_state);
     }
 
+    void on_add_update_transform() {
+        m_has_any_transform_updates = true;
+    }
+
 private:
     ScriptState::GarbageCollectionData make_gc_data() const {
         ScriptState::GarbageCollectionData data{};
@@ -287,6 +422,10 @@ private:
     std::shared_mutex m_script_error_mutex{};
     std::chrono::system_clock::time_point m_last_script_error_time{};
 
+    std::chrono::system_clock::time_point m_scene_check_time{};
+    bool m_checked_scene_once{false};
+    bool m_scene_okay{false};
+    bool m_has_any_transform_updates{false};
     bool m_console_spawned{false};
     bool m_needs_first_reset{true};
     bool m_last_online_match_state{false};

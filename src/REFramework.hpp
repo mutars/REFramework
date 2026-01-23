@@ -3,11 +3,13 @@
 #include <array>
 #include <unordered_set>
 #include <filesystem>
+#include <map>
 
 #include <spdlog/spdlog.h>
 #include <imgui.h>
 #include <utility/Patch.hpp>
 
+#include <../../directxtk12-src/Inc/GraphicsMemory.h>
 #include "mods/vr/d3d12/CommandContext.hpp"
 
 class Mods;
@@ -23,12 +25,33 @@ class RETypes;
 class REFramework {
 private:
     void hook_monitor();
+    std::atomic<uint32_t> m_do_not_hook_d3d_count{0};
+
+public:
+    struct DoNotHook {
+        DoNotHook(std::atomic<uint32_t>& count) : m_count(count) {
+            ++m_count;
+        }
+    
+        ~DoNotHook() {
+            --m_count;
+        }
+
+    private:
+        std::atomic<uint32_t>& m_count;
+    };
+
+    DoNotHook acquire_do_not_hook_d3d() {
+        return DoNotHook{m_do_not_hook_d3d_count};
+    }
+
 
 public:
     REFramework(HMODULE reframework_module);
     virtual ~REFramework();
 
-    auto get_reframework_module() const { return m_reframework_module; }
+    static auto get_reframework_module() { return s_reframework_module; }
+    static void set_reframework_module(HMODULE module) { s_reframework_module = module; }
 
     bool is_valid() const { return m_valid; }
 
@@ -44,6 +67,8 @@ public:
     Address get_module() const { return m_game_module; }
 
     bool is_ready() const { return m_initialized && m_game_data_initialized; }
+    bool is_game_data_initialized() const { return m_game_data_initialized; }
+    bool is_ui_focused() const { return m_is_ui_focused; }
 
     void run_imgui_frame(bool from_present);
 
@@ -66,7 +91,9 @@ public:
         return get_persistent_dir() / dir;
     }
 
-    void save_config();
+    void request_save_config() {
+        m_wants_save_config = true;
+    }
 
     enum class RendererType : uint8_t {
         D3D11,
@@ -100,6 +127,10 @@ public:
         return "sf6";
     #elif defined(DD2)
         return "dd2";
+    #elif defined(MHWILDS)
+        return "mhwilds";
+    #elif defined(PRAGMATA)
+        return "pragmata";
     #else
         return "unknown";
     #endif
@@ -115,16 +146,24 @@ public:
         return m_hook_monitor_mutex;
     }
 
+    auto& get_startup_mutex() {
+        return m_startup_mutex;
+    }
+
     void set_font_size(int size) { 
         if (m_font_size != size) {
             m_font_size = size;
-            m_fonts_need_updating = true;
         }
     }
 
     auto get_font_size() const { return m_font_size; }
 
-    int add_font(const std::filesystem::path& filepath, int size, const std::vector<ImWchar>& ranges = {});
+    void set_font(std::string path) { 
+        m_default_font_file = path;
+        m_fonts_need_init = true;
+    }
+
+    int add_font(const std::filesystem::path& filepath, float size);
 
     ImFont* get_font(int index) const {
         if (index >= 0 && index < m_additional_fonts.size()) {
@@ -134,17 +173,28 @@ public:
         }
     }
 
+    auto get_font_size(int index) const {
+        if (index >= 0 && index < m_additional_fonts.size()) {
+            return m_additional_fonts[index].size;
+        } else {
+            return m_font_size;
+        }
+    }
+
 private:
+        void save_config();
     void consume_input();
-    void update_fonts();
+    void init_fonts();
     void invalidate_device_objects();
 
     void draw_ui();
     void draw_about();
 
+public:
     bool hook_d3d11();
     bool hook_d3d12();
 
+private:
     bool initialize();
     bool initialize_game_data();
     bool initialize_windows_message_hook();
@@ -153,7 +203,7 @@ private:
 
     void call_on_frame();
 
-    HMODULE m_reframework_module{};
+    static inline HMODULE s_reframework_module{};
 
     bool m_first_frame{true};
     bool m_first_frame_d3d_initialize{true};
@@ -170,6 +220,7 @@ private:
     // UI
     bool m_has_frame{false};
     bool m_wants_device_object_cleanup{false};
+    bool m_wants_save_config{false};
     bool m_draw_ui{true};
     bool m_last_draw_ui{m_draw_ui};
     bool m_is_ui_focused{false};
@@ -183,13 +234,15 @@ private:
 
     struct AdditionalFont {
         std::filesystem::path filepath{};
-        int size{16};
-        std::vector<ImWchar> ranges{};
+        float size{16};
         ImFont* font{};
     };
 
-    bool m_fonts_need_updating{true};
-    int m_font_size{16};
+    std::string m_default_font_file = "DEFAULT";
+    bool m_fonts_need_init{true};
+    float m_font_size{16};
+    ImFont* m_default_font;
+    std::map<std::string, ImFont*> loaded_fonts{};
     std::vector<AdditionalFont> m_additional_fonts{};
 
     std::mutex m_input_mutex{};
@@ -271,6 +324,13 @@ private: // D3D12 members
             BACKBUFFER_0,
             BACKBUFFER_1,
             BACKBUFFER_2,
+            BACKBUFFER_3,
+            BACKBUFFER_4,
+            BACKBUFFER_5,
+            BACKBUFFER_6,
+            BACKBUFFER_7,
+            BACKBUFFER_8,
+            BACKBUFFER_LAST = BACKBUFFER_8,
             IMGUI,
             BLANK,
             COUNT,
@@ -309,6 +369,7 @@ private: // D3D12 members
         uint32_t rt_height{};
 
         std::array<void*, 2> imgui_backend_datas{};
+        std::unique_ptr<DirectX::DX12::GraphicsMemory> graphics_memory{}; // for use in several places around REF
     } m_d3d12{};
 
 public:
@@ -321,3 +382,6 @@ private:
 };
 
 extern std::unique_ptr<REFramework> g_framework;
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam); // Use ImGui::GetCurrentContext()

@@ -6,6 +6,7 @@
 #include "HookManager.hpp"
 #include "sdk/REContext.hpp"
 #include "sdk/REManagedObject.hpp"
+#include "sdk/REDelegate.hpp"
 #include "sdk/RETypeDB.hpp"
 #include "sdk/SceneManager.hpp"
 #include "sdk/ResourceManager.hpp"
@@ -324,13 +325,42 @@ int sol_lua_push(sol::types<T*>, lua_State* l, T* obj) {
     return sol::stack::push(l, sol::nil);
 }
 
+namespace api::delegate {
+void add_lua_delegate(sol::this_state s, ::sdk::Delegate* delegate, uint32_t index, sol::protected_function callback) {
+    if (index >= delegate->num_methods) {
+        throw sol::error("Delegate index out of bounds");
+    }
+
+    auto& invo = delegate->methods[index];
+    auto sol_state = sol::state_view{s};
+    auto state = sol_state.registry()["state"].get<ScriptState*>();
+
+    state->add_delegate_callback(invo, callback);
+}
+
+// newindex
+void new_index(sol::this_state s, ::sdk::Delegate* delegate, sol::object lua_obj, sol::variadic_args args) {
+    if (lua_obj.is<uint32_t>()) {
+        auto index = lua_obj.as<uint32_t>();
+
+        if (args[0].is<sol::protected_function>()) {
+            auto callback = args[0].get<sol::protected_function>();
+
+            add_lua_delegate(s, delegate, index, callback);
+        } else {
+            throw sol::error("Delegate callback must be a function");
+        }
+    }
+}
+}
+
 namespace api::sdk {
 std::vector<void*>& build_args(sol::variadic_args va);
 sol::object parse_data(lua_State* l, void* data, ::sdk::RETypeDefinition* data_type, bool from_method);
 sol::object get_native_field(sol::object obj, ::sdk::RETypeDefinition* ty, const char* name);
 sol::object get_native_field_from_field(sol::object obj, ::sdk::RETypeDefinition* ty, ::sdk::REField* field);
 sol::object get_field_or_method(sol::object obj, const char* name);
-void set_native_field(lua_State* l, sol::object obj, ::sdk::RETypeDefinition* ty, const char* name, sol::object value);
+void set_native_field(sol::this_state s, sol::object obj, ::sdk::RETypeDefinition* ty, const char* name, sol::object value);
 
 struct ValueType {
     std::vector<uint8_t> data{};
@@ -402,7 +432,8 @@ struct ValueType {
             return sol::make_object(l, sol::nil);
         }
 
-        auto ret_val = def->invoke(real_obj, ::api::sdk::build_args(va));
+        auto vec_args = ::api::sdk::build_args(va);
+        auto ret_val = def->invoke(real_obj, std::span(vec_args));
 
         if (ret_val.exception_thrown) {
             throw sol::error("Invoke threw an exception");
@@ -582,6 +613,36 @@ sol::object create_managed_array(sol::this_state s, sol::object t_obj, uint32_t 
     return sol::make_object(s, (::sdk::SystemArray*)out);
 }
 
+sol::object create_delegate(sol::this_state s, sol::object t_obj, uint32_t num_methods) {
+    ::REManagedObject* t{nullptr};
+
+    if (t_obj.is<::REManagedObject*>()) {
+        t = t_obj.as<::REManagedObject*>();
+    } else if (t_obj.is<::sdk::RETypeDefinition*>()) {
+        t = t_obj.as<::sdk::RETypeDefinition*>()->get_runtime_type();
+    } else if (t_obj.is<const char*>()) {
+        const auto tdef = ::sdk::find_type_definition(t_obj.as<const char*>());
+
+        if (tdef != nullptr) {
+            t = tdef->get_runtime_type();
+        }
+    } else {
+        throw sol::error("Invalid type passed to create_delegate. Must be a runtime type, a type definition, or a type name.");
+    }
+
+    if (t == nullptr) {
+        throw sol::error("Type passed to create_delegate resolved to null.");
+    }
+
+    auto out = ::sdk::VM::create_delegate(t, num_methods);
+
+    if (out == nullptr) {
+        return sol::make_object(s, sol::nil);
+    }
+
+    return sol::make_object(s, out);
+}
+
 sol::object create_sbyte(sol::this_state s, int8_t value) {
     auto new_obj = ::sdk::VM::create_sbyte(value);
 
@@ -697,7 +758,24 @@ sol::object create_resource(sol::this_state s, std::string type_name, std::strin
     return sol::make_object(s, resource_manager->create_resource(t, utility::widen(name)));
 }
 
-sol::object create_userdata(sol::this_state s, std::string type_name, std::string name) {
+sol::object create_global_object(sol::this_state &s, ::REManagedObject *obj) {
+    bool is_currently_local = static_cast<std::int32_t>(obj->referenceCount) <= 0;
+
+    // Mark object as global so that lua knows
+    if (is_currently_local) {
+        utility::re_managed_object::add_ref(obj);
+    }
+
+    auto obj_safe = sol::make_object(s, obj);
+
+    if (is_currently_local) {
+        utility::re_managed_object::release(obj);
+    }
+
+    return obj_safe;
+}
+
+sol::object create_userdata_impl(sol::this_state s, std::string type_name, std::string name, bool global) {
     auto& types = reframework::get_types();
 
     // NOT a type definition!!
@@ -715,10 +793,24 @@ sol::object create_userdata(sol::this_state s, std::string type_name, std::strin
         return sol::make_object(s, sol::nil);
     }
 
-    return sol::make_object(s, (::REManagedObject*)obj.get());
+    auto re_obj = (::REManagedObject*)obj.get();
+
+    if (global) {
+        return create_global_object(s, re_obj);
+    } else {
+        return sol::make_object(s, re_obj);
+    }
 }
 
-sol::object create_instance(sol::this_state s, const char* name, sol::object simplify_obj) {
+sol::object create_userdata(sol::this_state s, std::string type_name, std::string name) {
+    return create_userdata_impl(s, type_name, name, false);
+}
+
+sol::object create_userdata_global(sol::this_state s, std::string type_name, std::string name) {
+    return create_userdata_impl(s, type_name, name, true);
+}
+
+sol::object create_instance_impl(sol::this_state s, const char* name, sol::object simplify_obj, bool global) {
     bool simplify = false;
 
     if (simplify_obj.is<bool>()) {
@@ -735,7 +827,81 @@ sol::object create_instance(sol::this_state s, const char* name, sol::object sim
         return sol::make_object(s, sol::nil);
     }
 
-    return sol::make_object(s, type_definition->create_instance_full(simplify));
+    auto instance_full = type_definition->create_instance_full(simplify);
+
+    if (global) {
+        return create_global_object(s, instance_full);
+    } else {
+        return sol::make_object(s, instance_full);
+    }
+}
+
+sol::object create_instance(sol::this_state s, const char* name, sol::object simplify_obj) {
+    return create_instance_impl(s, name, simplify_obj, false);
+}
+
+sol::object create_instance_global(sol::this_state s, const char* name, sol::object simplify_obj) {
+    return create_instance_impl(s, name, simplify_obj, true);
+}
+
+sol::object create_holder_impl(sol::this_state s, ::sdk::Resource* res, const char* tn, bool global) {
+    if (tn == nullptr) {
+        return sol::make_object(s, sol::nil);
+    }
+
+    const auto t = sdk::find_type_definition(tn);
+
+    if (t == nullptr) {
+        return sol::make_object(s, sol::nil);
+    }
+
+    auto holder = res->create_holder(t);
+
+    if (holder == nullptr) {
+        return sol::make_object(s, sol::nil);
+    }
+
+    if (global) {
+        return create_global_object(s, holder);
+    } else {
+        return sol::make_object(s, holder);
+    }
+}
+
+sol::object create_holder(sol::this_state s, ::sdk::Resource* res, const char* tn) {
+    return create_holder_impl(s, res, tn, false);
+}
+
+sol::object create_holder_global(sol::this_state s, ::sdk::Resource* res, const char* tn) {
+    return create_holder_impl(s, res, tn, true);
+}
+
+bool copy_to_clipboard(sol::this_state s, const char* text) {
+    if (text == nullptr) {
+        return false;
+    }
+
+    if (OpenClipboard(nullptr)) {
+        EmptyClipboard();
+
+        size_t len = strlen(text) + 1;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+
+        if (hMem) {
+            memcpy(GlobalLock(hMem), text, len);
+            GlobalUnlock(hMem);
+
+            SetClipboardData(CF_TEXT, hMem);
+        } else {
+            return false;
+        }
+
+        CloseClipboard();
+    } else {
+        return false;
+    }
+
+    return true;
 }
 
 void* get_real_obj(sol::object obj) {
@@ -799,6 +965,10 @@ sol::object parse_data(lua_State* l, void* data, ::sdk::RETypeDefinition* data_t
                 return sol::make_object(l, ret_val_f);
             }
         }
+        case "System.Double"_fnv: {
+            auto ret_val_d = *(double*)data;
+            return sol::make_object(l, ret_val_d);
+        }
         case "System.Boolean"_fnv: {
             auto ret_val_b = *(bool*)data;
             return sol::make_object(l, ret_val_b);
@@ -832,7 +1002,10 @@ sol::object parse_data(lua_State* l, void* data, ::sdk::RETypeDefinition* data_t
             return sol::make_object(l, ret_val_u);
         }
         case "System.UInt64"_fnv: {
-            auto ret_val_u = *(uint64_t*)data;
+            //auto ret_val_u = *(uint64_t*)data;
+            // so, sol is converting the unsigned version incorrectly into some 1.blah e+19 number
+            // so just return it as signed since Lua only has signed integers
+            auto ret_val_u = *(int64_t*)data;
             return sol::make_object(l, ret_val_u);
         }
         case "via.Float2"_fnv: [[fallthrough]];
@@ -925,9 +1098,31 @@ void set_data(void* data, ::sdk::RETypeDefinition* data_type, sol::object& value
             full_name_hash = utility::hash(data_type->get_full_name());
         }
 
+        // Commemorating the moment I finally added support for this
+        // ....... 2 years after the Lua API was first created
+        // This allows us to pass arbitrary ValueTypes and set fields with them
+        // So we don't need to hardcode every possible ValueType, just the most important ones like Int32, Single, vec3, etc...
+        if (data != nullptr && vm_obj_type == via::clr::VMObjType::ValType && value.is<ValueType*>()) {
+            auto vt = value.as<ValueType*>();
+
+            if (vt->type != data_type) {
+                if (vt->type != nullptr && data_type != nullptr) {
+                    throw sol::error(std::format("Attempted to set ValueType of type {} to field of type {}", vt->type->get_full_name(), data_type->get_full_name()));
+                }
+
+                throw sol::error("Attempted to set ValueType to field of unknown type");
+            }
+
+            memcpy(data, vt->data.data(), vt->data.size());
+            return;
+        }
+
         switch (full_name_hash) {
         case "System.Single"_fnv:
             *(float*)data = value.as<float>();
+            return;
+        case "System.Double"_fnv:
+            *(double*)data = value.as<double>();
             return;
         case "System.Boolean"_fnv:
             *(bool*)data = value.as<bool>();
@@ -951,10 +1146,10 @@ void set_data(void* data, ::sdk::RETypeDefinition* data_type, sol::object& value
             *(int32_t*)data = value.as<int32_t>();
             return;
         case "System.Int64"_fnv:
-            *(int64_t*)data = value.as<int32_t>();
+            *(int64_t*)data = value.as<int64_t>();
             return;
         case "System.UInt64"_fnv:
-            *(uint64_t*)data = value.as<int32_t>();
+            *(int64_t*)data = value.as<int64_t>();
             return;
         case "via.Float2"_fnv: [[fallthrough]];
         case "via.vec2"_fnv:
@@ -984,13 +1179,22 @@ void set_data(void* data, ::sdk::RETypeDefinition* data_type, sol::object& value
                 }
 
                 REManagedObject** field = (REManagedObject**) data;
-                if (field != nullptr && *field != nullptr) {
-                    utility::re_managed_object::release(*field);
+                if (field != nullptr && *field != new_data) {
+                    if (new_data != nullptr) {
+                        utility::re_managed_object::add_ref(new_data);
+                    }
+
+                    // Use a thread-safe atomic exchange. This is what Capcom does for all field assignments.
+                    auto old = *field;
+                    while (_InterlockedCompareExchangePointer((PVOID*)field, new_data, old) != old) {
+                        old = *field;
+                    }
+
+                    if (old != nullptr) {
+                        utility::re_managed_object::release(old);
+                    }
                 }
-                if (new_data != nullptr) {
-                    utility::re_managed_object::add_ref(new_data);
-                }
-                *(REManagedObject**) data = new_data;
+
                 return;
             }
         }
@@ -1025,9 +1229,10 @@ void set_native_field_from_field(sol::object obj, ::sdk::RETypeDefinition* ty, :
     set_data(data, field_type, value);
 }
 
-void set_native_field(lua_State* l, sol::object obj, ::sdk::RETypeDefinition* ty, const char* name, sol::object value) {
+void set_native_field(sol::this_state s, sol::object obj, ::sdk::RETypeDefinition* ty, const char* name, sol::object value) {
     const auto field = ty->get_field(name);
     if (field == nullptr) {
+        auto l = s.lua_state();
         //throw sol::error("Attempted to set invalid REManagedObject field:" + std::string(name));
         luaL_traceback(l, l, ("Attempted to set invalid REManagedObject field:" + std::string(name)).c_str(), 1);
         std::string traceback_err = lua_tostring(l, -1);
@@ -1346,7 +1551,7 @@ T read_memory(::REManagedObject* obj, int32_t offset) {
 
     return *(T*)((uintptr_t)obj + offset);
 }
-} 
+}
 
 void bindings::open_sdk(ScriptState* s) {
     auto& lua = s->lua();
@@ -1367,6 +1572,7 @@ void bindings::open_sdk(ScriptState* s) {
     sdk["get_managed_singleton"] = api::sdk::get_managed_singleton;
     sdk["create_managed_string"] = api::sdk::create_managed_string;
     sdk["create_managed_array"] = api::sdk::create_managed_array;
+    sdk["create_delegate"] = api::sdk::create_delegate;
     sdk["create_sbyte"] = api::sdk::create_sbyte;
     sdk["create_byte"] = api::sdk::create_byte;
     sdk["create_int16"] = api::sdk::create_int16;
@@ -1379,7 +1585,9 @@ void bindings::open_sdk(ScriptState* s) {
     sdk["create_double"] = api::sdk::create_double;
     sdk["create_resource"] = api::sdk::create_resource;
     sdk["create_userdata"] = api::sdk::create_userdata;
+    sdk["create_userdata_global"] = api::sdk::create_userdata_global;
     sdk["create_instance"] = api::sdk::create_instance;
+    sdk["create_instance_global"] = api::sdk::create_instance_global;
     sdk["find_type_definition"] = api::sdk::find_type_definition;
     sdk["typeof"] = api::sdk::typeof;
     sdk["call_native_func"] = api::sdk::call_native_func;
@@ -1387,6 +1595,7 @@ void bindings::open_sdk(ScriptState* s) {
     sdk["get_native_field"] = api::sdk::get_native_field;
     sdk["set_native_field"] = api::sdk::set_native_field;
     sdk["get_primary_camera"] = api::sdk::get_primary_camera;
+    sdk["copy_to_clipboard"] = api::sdk::copy_to_clipboard;
     sdk["hook"] = api::sdk::hook;
     sdk["hook_vtable"] = api::sdk::hook_vtable;
     sdk.new_enum("PreHookResult", "CALL_ORIGINAL", HookManager::PreHookResult::CALL_ORIGINAL, "SKIP_ORIGINAL", HookManager::PreHookResult::SKIP_ORIGINAL);
@@ -1539,7 +1748,13 @@ void bindings::open_sdk(ScriptState* s) {
 
             return false;
         },
-        "create_instance", &::sdk::RETypeDefinition::create_instance_full);
+        "create_instance", &::sdk::RETypeDefinition::create_instance_full,
+        "create_instance_gc_safe", [](sol::this_state s, ::sdk::RETypeDefinition* type_def_obj) {
+            auto obj = type_def_obj->create_instance_full();
+            return api::sdk::create_global_object(s, obj);
+        },
+        "get_types_inheriting_from_this", &::sdk::RETypeDefinition::get_types_inherting_from_this
+    );
 
     auto method_call = [](sdk::REMethodDefinition* def, sol::object obj, sol::variadic_args va) {
         auto l = va.lua_state();
@@ -1656,7 +1871,7 @@ void bindings::open_sdk(ScriptState* s) {
                 return;
             }
 
-            return api::sdk::set_native_field(s->lua(), sol::make_object(s->lua(), obj), utility::re_managed_object::get_type_definition(obj), name, value); 
+            return api::sdk::set_native_field(sol::this_state{s->lua()}, sol::make_object(s->lua(), obj), utility::re_managed_object::get_type_definition(obj), name, value); 
         },
         "call", [s](REManagedObject* obj, const char* name, sol::variadic_args args) {
             if (obj == nullptr) {
@@ -1668,13 +1883,13 @@ void bindings::open_sdk(ScriptState* s) {
         "write_byte", &api::re_managed_object::write_memory<uint8_t>,
         "write_short", &api::re_managed_object::write_memory<uint16_t>,
         "write_dword", &api::re_managed_object::write_memory<uint32_t>,
-        "write_qword", &api::re_managed_object::write_memory<uint64_t>,
+        "write_qword", &api::re_managed_object::write_memory<int64_t>,
         "write_float", &api::re_managed_object::write_memory<float>,
         "write_double", &api::re_managed_object::write_memory<double>,
         "read_byte", &api::re_managed_object::read_memory<uint8_t>,
         "read_short", &api::re_managed_object::read_memory<uint16_t>,
         "read_dword", &api::re_managed_object::read_memory<uint32_t>,
-        "read_qword", &api::re_managed_object::read_memory<uint64_t>,
+        "read_qword", &api::re_managed_object::read_memory<int64_t>,
         "read_float", &api::re_managed_object::read_memory<float>,
         "read_double", &api::re_managed_object::read_memory<double>
     );
@@ -1740,6 +1955,14 @@ void bindings::open_sdk(ScriptState* s) {
         "set_rotation", &sdk::set_transform_rotation,
         "get_position", &sdk::get_transform_position,
         "get_rotation", &sdk::get_transform_rotation,
+        "hook_update", [](sol::this_state s, RETransform* transform, sol::protected_function fn) {
+            if (transform == nullptr) {
+                return;
+            }
+            auto sol_state = sol::state_view{s};
+            auto state = sol_state.registry()["state"].get<ScriptState*>();
+            state->add_update_transform(transform, fn);
+        },
         sol::base_classes, sol::bases<::REComponent, ::REManagedObject>()
     );
 
@@ -1787,6 +2010,15 @@ void bindings::open_sdk(ScriptState* s) {
     );
 
     create_managed_object_ptr_gc((sdk::SystemArray*)nullptr);
+
+    lua.new_usertype<sdk::Delegate>("Delegate",
+        "add", &api::delegate::add_lua_delegate,
+        "invoke", &sdk::Delegate::invoke,
+        sol::meta_function::new_index, &api::delegate::new_index,
+        sol::base_classes, sol::bases<::REManagedObject>()
+    );
+
+    create_managed_object_ptr_gc((sdk::Delegate*)nullptr);
     
     lua.new_usertype<api::sdk::ValueType>("ValueType",
         sol::meta_function::construct, sol::constructors<api::sdk::ValueType(sdk::RETypeDefinition*)>(),
@@ -1797,13 +2029,13 @@ void bindings::open_sdk(ScriptState* s) {
         "write_byte", &api::sdk::ValueType::write_memory<uint8_t>,
         "write_short", &api::sdk::ValueType::write_memory<uint16_t>,
         "write_dword", &api::sdk::ValueType::write_memory<uint32_t>,
-        "write_qword", &api::sdk::ValueType::write_memory<uint64_t>,
+        "write_qword", &api::sdk::ValueType::write_memory<int64_t>,
         "write_float", &api::sdk::ValueType::write_memory<float>,
         "write_double", &api::sdk::ValueType::write_memory<double>,
         "read_byte", &api::sdk::ValueType::read_memory<uint8_t>,
         "read_short", &api::sdk::ValueType::read_memory<uint16_t>,
         "read_dword", &api::sdk::ValueType::read_memory<uint32_t>,
-        "read_qword", &api::sdk::ValueType::read_memory<uint64_t>,
+        "read_qword", &api::sdk::ValueType::read_memory<int64_t>,
         "read_float", &api::sdk::ValueType::read_memory<float>,
         "read_double", &api::sdk::ValueType::read_memory<double>,
         "address", &api::sdk::ValueType::address,
@@ -1818,13 +2050,13 @@ void bindings::open_sdk(ScriptState* s) {
         "write_byte", &api::sdk::MemoryView::write_memory<uint8_t>,
         "write_short", &api::sdk::MemoryView::write_memory<uint16_t>,
         "write_dword", &api::sdk::MemoryView::write_memory<uint32_t>,
-        "write_qword", &api::sdk::MemoryView::write_memory<uint64_t>,
+        "write_qword", &api::sdk::MemoryView::write_memory<int64_t>,
         "write_float", &api::sdk::MemoryView::write_memory<float>,
         "write_double", &api::sdk::MemoryView::write_memory<double>,
         "read_byte", &api::sdk::MemoryView::read_memory<uint8_t>,
         "read_short", &api::sdk::MemoryView::read_memory<uint16_t>,
         "read_dword", &api::sdk::MemoryView::read_memory<uint32_t>,
-        "read_qword", &api::sdk::MemoryView::read_memory<uint64_t>,
+        "read_qword", &api::sdk::MemoryView::read_memory<int64_t>,
         "read_float", &api::sdk::MemoryView::read_memory<float>,
         "read_double", &api::sdk::MemoryView::read_memory<double>,
         "address", &api::sdk::MemoryView::address,
@@ -1842,25 +2074,8 @@ void bindings::open_sdk(ScriptState* s) {
         "release", [](::sdk::Resource* res) {
             res->release();
         },
-        "create_holder", [](sol::this_state s, ::sdk::Resource* res, const char* tn) {
-            if (tn == nullptr) {
-                return sol::make_object(s, sol::nil);
-            }
-
-            const auto t = sdk::find_type_definition(tn);
-
-            if (t == nullptr) {
-                return sol::make_object(s, sol::nil);
-            }
-
-            auto holder = res->create_holder(t);
-
-            if (holder == nullptr) {
-                return sol::make_object(s, sol::nil);
-            }
-
-            return sol::make_object(s, (::REManagedObject*)holder);
-        },
+        "create_holder", &::api::sdk::create_holder,
+        "create_holder_global", &::api::sdk::create_holder_global,
         "get_address", [](::sdk::Resource* res) { return (uintptr_t)res; }
     );
 

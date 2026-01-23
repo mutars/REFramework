@@ -5,6 +5,7 @@
 #include <utility/String.hpp>
 #include <utility/Memory.hpp>
 
+#include "sdk/GUIPrimitiveSystem.hpp"
 #include "sdk/Application.hpp"
 
 #include "Hooks.hpp"
@@ -167,11 +168,18 @@ std::optional<std::string> Hooks::hook_update_transform() {
         uint32_t offset;
     };
 
+    /*
+        these instructions are near the UpdateTransform call
+        mov     eax, 1
+        lock xadd [rsi+318h], eax
+        cdqe
+    */
     std::vector<TransformPattern> pats {
         { "E8 ? ? ? ? 48 8B 5B ? 48 85 DB 75 ? 48 8B 4D 40 48 ? ?", 1 }, // RE2 - MHRise v1.0
         { "33 D2 E8 ? ? ? ? B8 01 00 00 00 F0 0F", 3 }, // RE7/RE2/RE3 update to TDB v70/newer games?
         { "0F B6 D1 48 8B CB E8 ? ? ? ? 48 8B 9B ? ? ? ?", 7 }, // RE7
-        { "0F B6 D0 48 8B CB E8 ? ? ? ? 48 8B 9B ? ? ? ?", 7 } // RE7 Demo
+        { "0F B6 D0 48 8B CB E8 ? ? ? ? 48 8B 9B ? ? ? ?", 7 }, // RE7 Demo
+        { "31 D2 41 ? F8 E8 ? ? ? ? EB", 6}, // MHWILDS/TDB74+
     };
 
     uintptr_t update_transform = 0;
@@ -286,6 +294,7 @@ std::optional<std::string> Hooks::hook_gui_draw() {
     ++*(_DWORD *)(gui_manager + 232);
     *(_QWORD *)&v35 = draw_task_function; <-- "gui_draw_call" is found within this function.
     */
+    size_t offset = 12;
     spdlog::info("[Hooks] Scanning for first GUI draw call...");
     auto gui_draw_call = utility::scan(game, "49 8B 0C CE 48 83 79 10 00 74 ? E8 ? ? ? ?");
 
@@ -295,13 +304,27 @@ std::optional<std::string> Hooks::hook_gui_draw() {
         gui_draw_call = utility::scan(game, "49 8B 0C CE 48 83 79 20 00 74 ? E8 ? ? ? ?");
 
         if (!gui_draw_call) {
-            return "Unable to find gui_draw_call pattern.";
+            // MHWILDS
+            gui_draw_call = utility::scan(game, "48 8B 0C C3 48 83 79 ? 00 74 ? 48 89 ? E8 ? ? ? ?");
+            offset = 15;
+
+            if (!gui_draw_call) {
+                // PRAGMATA
+                gui_draw_call = utility::scan(game, "49 8B 0C C6 48 83 79 ? 00 74 ? E8 ? ? ? ?");
+                offset = 12;
+
+                if (!gui_draw_call) {
+                    //return "Unable to find gui_draw_call pattern.";
+                    spdlog::error("[Hooks] Unable to find gui_draw_call pattern.");
+                    return std::nullopt; // Don't bother erroring out the entire mod just because of this
+                }
+            }
         }
     }
 
     spdlog::info("[Hooks] Found gui_draw_call at {:x}", *gui_draw_call);
 
-    auto gui_draw = utility::calculate_absolute(*gui_draw_call + 12);
+    auto gui_draw = utility::calculate_absolute(*gui_draw_call + offset);
     spdlog::info("[Hooks] gui_draw: {:x}", gui_draw);
 
     m_gui_draw_hook = std::make_unique<FunctionHook>(gui_draw, &gui_draw_hook);
@@ -356,7 +379,7 @@ std::optional<std::string> Hooks::hook_all_application_entries() {
     }
 
     spdlog::info("[Hooks] Found via.Application at {:x}", (uintptr_t)application);
-
+    
     auto generate_mov_rdx = [](uintptr_t target) {
         std::vector<uint8_t> mov_rdx{ 0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
         *(uintptr_t*)&mov_rdx[2] = target;
@@ -478,6 +501,8 @@ std::optional<std::string> Hooks::hook_all_application_entries() {
 }
 
 std::optional<std::string> Hooks::hook_update_before_lock_scene() {
+    // This function is removed (or not reflected) >= TDB74...
+#if TDB_VER < 74
     // Hook updateBeforeLockScene
     auto update_before_lock_scene = sdk::find_native_method("via.render.EntityRenderer", "updateBeforeLockScene");
 
@@ -492,6 +517,7 @@ std::optional<std::string> Hooks::hook_update_before_lock_scene() {
     if (!m_update_before_lock_scene_hook->create()) {
         return "Failed to hook via::render::EntityRenderer::updateBeforeLockScene";
     }
+#endif
 
     return std::nullopt;
 }
@@ -552,13 +578,29 @@ std::optional<std::string> Hooks::hook_view_get_size() {
     spdlog::info("via.SceneView.get_Size: {:x}", (uintptr_t)get_size_func);
 
     // Pattern scan for the native function call
-    auto ref = utility::scan((uintptr_t)get_size_func, 0x100, "49 8B C8 E8");
+    //auto ref = utility::scan((uintptr_t)get_size_func, 0x100, "49 8B C8 E8");
+    auto ref = utility::find_pattern_in_path((uint8_t*)get_size_func, 1000, false, "49 8B C8 E8");
+
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)get_size_func, 1000, false, "48 8B CB E8");
+    }
+
+    
+#if TDB_VER >= 74
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)get_size_func, 1000, false, "48 89 F2 E8"); // >= TDB74 (MHWILDS)
+    }
+
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)get_size_func, 1000, false, "48 8B CF E8"); // Pragmata
+    }
+#endif
 
     if (!ref) {
         return "Hook init failed: via.SceneView.get_Size native function not found. Pattern scan failed.";
     }
 
-    auto native_func = utility::calculate_absolute(*ref + 4);
+    auto native_func = utility::calculate_absolute(ref->addr + 4);
 
     // Hook the native function
     m_view_get_size_hook = std::make_unique<FunctionHook>(native_func, view_get_size_hook);
@@ -582,13 +624,23 @@ std::optional<std::string> Hooks::hook_camera_get_projection_matrix() {
     spdlog::info("via.Camera.get_ProjectionMatrix: {:x}", (uintptr_t)func);
     
     // Pattern scan for the native function call
-    auto ref = utility::scan((uintptr_t)func, 0x100, "49 8B C8 E8");
+    auto ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "49 8B C8 E8");
+
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "48 8B CB E8");
+    }
+    
+#if TDB_VER >= 74
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "48 89 F2 E8"); // >= TDB74?
+    }
+#endif
 
     if (!ref) {
         return "Hook init failed: via.Camera.get_ProjectionMatrix native function not found. Pattern scan failed.";
     }
 
-    auto native_func = utility::calculate_absolute(*ref + 4);
+    auto native_func = utility::calculate_absolute(ref->addr + 4);
 
     // Hook the native function
     m_camera_get_projection_matrix_hook = std::make_unique<FunctionHook>(native_func, camera_get_projection_matrix_hook);
@@ -612,13 +664,23 @@ std::optional<std::string> Hooks::hook_camera_get_view_matrix() {
     spdlog::info("via.Camera.get_ViewMatrix: {:x}", (uintptr_t)func);
 
     // Pattern scan for the native function call
-    auto ref = utility::scan((uintptr_t)func, 0x100, "49 8B C8 E8");
+    auto ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "49 8B C8 E8");
+
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "48 8B CB E8");
+    }
+
+#if TDB_VER >= 74
+    if (!ref) {
+        ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "48 89 F2 E8"); // >= TDB74?
+    }
+#endif
 
     if (!ref) {
         return "Hook init failed: via.Camera.get_ViewMatrix native function not found. Pattern scan failed.";
     }
 
-    auto native_func = utility::calculate_absolute(*ref + 4);
+    auto native_func = utility::calculate_absolute(ref->addr + 4);
 
     // Hook the native function
     m_camera_get_view_matrix_hook = std::make_unique<FunctionHook>(native_func, camera_get_view_matrix_hook);
@@ -848,7 +910,7 @@ void Hooks::global_application_entry_hook_internal(void* entry, const char* name
 
     auto original = m_application_entry_hooks[name];
 
-    if (!g_framework->is_ready()) {
+    if (!g_framework->is_game_data_initialized()) {
         return original(entry);
     }
 
@@ -862,6 +924,21 @@ void Hooks::global_application_entry_hook_internal(void* entry, const char* name
         if (m_ignored_application_entries.contains(hash)) {
             return;
         }
+    }
+
+    if (hash == "BeginRendering"_fnv) {
+#if TDB_VER >= 73
+    if (auto primitive_system = sdk::gui::renderer::PrimitiveSystem::get(); primitive_system != nullptr) {
+        auto primitive_buffer = primitive_system->get_primitive_buffer();
+        
+        if (primitive_buffer != nullptr) {
+            if (primitive_buffer->scratch.used >= primitive_buffer->scratch.size) {
+                spdlog::info("[GUI] Resizing scratch buffer from {} to {}", primitive_buffer->scratch.size, primitive_buffer->scratch.size * 2);
+                primitive_buffer->scratch.resize(primitive_buffer->scratch.size * 2);
+            }
+        }
+    }
+#endif
     }
 
     if (m_profiling_enabled) {

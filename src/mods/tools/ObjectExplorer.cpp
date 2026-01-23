@@ -7,6 +7,7 @@
 #include <json.hpp>
 
 #include <windows.h>
+#include <TlHelp32.h>
 
 #include <utility/String.hpp>
 #include <utility/Scan.hpp>
@@ -23,6 +24,7 @@
 #include "Genny.hpp"
 #include "GennyIda.hpp"
 
+#include <sdk/REGameObject.hpp>
 #include "REFramework.hpp"
 #include "ObjectExplorer.hpp"
 
@@ -343,7 +345,13 @@ void ObjectExplorer::on_draw_dev_ui() {
         return;
     }
     if (ImGui::Button("Dump SDK")) {
-        std::thread t(&ObjectExplorer::generate_sdk, this);
+        std::thread t(&ObjectExplorer::generate_sdk, this, false);
+        t.detach();
+    }
+    
+    ImGui::SameLine();
+    if (ImGui::Button("Dump il2cpp json Only")) {
+        std::thread t(&ObjectExplorer::generate_sdk, this, true);
         t.detach();
     }
 
@@ -405,7 +413,8 @@ void ObjectExplorer::on_draw_dev_ui() {
         }
 
         // make a copy, we want to sort by name
-        auto singletons = reframework::get_globals()->get_objects();
+        auto singletons_unordered = reframework::get_globals()->get_objects();
+        std::vector<REManagedObject*> singletons{ singletons_unordered.begin(), singletons_unordered.end() };
 
         // first loop, sort
         std::sort(singletons.begin(), singletons.end(), [](REManagedObject* a, REManagedObject* b) {
@@ -498,8 +507,77 @@ void ObjectExplorer::on_draw_dev_ui() {
                 fake_type.resize(t->size);
             }
 
-            memset(fake_type.data(), 0, t->size);\
+            memset(fake_type.data(), 0, t->size);
             handle_type((REManagedObject*)fake_type.data(), t);
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Assemblies")) {
+        auto tdb = sdk::RETypeDB::get();
+
+        for (auto i = 0; i < tdb->get_num_modules(); ++i) {
+            auto& module = tdb->modules[i];
+            
+            if (ImGui::TreeNode(module.get_assembly_name())) {
+                ImGui::Text("Location: %s", module.get_location());
+                ImGui::Text("Module Name: %s", module.get_module_name());
+                
+                if (ImGui::TreeNode("Assembly Types")) {
+                    std::vector<uint8_t> fake_type{ 0 };
+
+                    for (auto& t_index : module.get_types()) {
+                        auto t = tdb->get_type(t_index);
+                        if (t == nullptr) {
+                            continue;
+                        }
+                        const auto size = t->get_size();
+                        if (size > fake_type.size()) {
+                            fake_type.resize(size);
+                        }
+
+                        memset(fake_type.data(), 0, size);
+                        handle_type((REManagedObject*)fake_type.data(), t->get_type());
+                    }
+
+                    ImGui::TreePop();
+                }
+
+                if (ImGui::TreeNode("Assembly Methods")) {
+                    for (auto& m_index : module.get_methods()) {
+                        auto m = tdb->get_method(m_index);
+                        if (m == nullptr) {
+                            continue;
+                        }
+                        attempt_display_method(nullptr, *m, true);
+                    }
+
+                    ImGui::TreePop();
+                }
+
+                if (ImGui::TreeNode("Assembly Instantiated Methods")) {
+                    for (auto& m_index : module.get_instantiated_methods()) {
+                        auto m = tdb->get_method(m_index);
+                        if (m == nullptr) {
+                            continue;
+                        }
+                        attempt_display_method(nullptr, *m, true);
+                    }
+
+                    ImGui::TreePop();
+                }
+
+                if (ImGui::TreeNode("Assembly Member References")) {
+                    for (auto& m_index : module.get_member_references()) {
+                        if (auto m = tdb->get_method(m_index); m != nullptr) {
+                            attempt_display_method(nullptr, *m, true);
+                        }
+                    }
+
+                    ImGui::TreePop();
+                }
+
+                ImGui::TreePop();
+            }
         }
     }
 
@@ -582,6 +660,30 @@ void ObjectExplorer::on_draw_dev_ui() {
         }
     }
 
+    if (ImGui::InputText("TDB Method Address", m_method_tdb_address.data(), 17, ImGuiInputTextFlags_::ImGuiInputTextFlags_CharsHexadecimal)) {
+        m_displayed_method = nullptr;
+
+        try {
+            if (m_method_tdb_address[0] != 0) {
+                const auto method_address = std::stoull(m_method_tdb_address, nullptr, 16);
+                const auto tdb = sdk::RETypeDB::get();
+
+                if (method_address >= (uintptr_t)tdb->methods && method_address < (uintptr_t)tdb->methods + (tdb->numMethods * sizeof(void*))) {
+                    // Make sure method address is aligned to sizeof(sdk::REMethodDefinition)
+                    if ((method_address % sizeof(sdk::REMethodDefinition)) == 0) {
+                        m_displayed_method = (sdk::REMethodDefinition*)method_address;
+                    } else {
+                        ImGui::Text("Invalid address");
+                    }
+                } else {
+                    ImGui::Text("Invalid address");
+                }
+            }
+        } catch (...) {
+            ImGui::Text("Invalid address");
+        }
+    }
+
     ImGui::InputText("REObject Address", m_object_address.data(), 17, ImGuiInputTextFlags_::ImGuiInputTextFlags_CharsHexadecimal);
 
     if (ImGui::Button("Create new game object"))  {
@@ -621,6 +723,35 @@ void ObjectExplorer::on_draw_dev_ui() {
 }
 
 void ObjectExplorer::on_frame() {
+    if (!m_veh_state.read_listeners.empty()) {
+        bool open = true;
+
+        ImGui::SetNextWindowSize(ImVec2(200, 400), ImGuiCond_::ImGuiCond_Once);
+        if (ImGui::Begin("Read Listeners", &open)) {
+            std::shared_lock _{m_veh_state.listener_mtx};
+
+            for (auto& listener : m_veh_state.read_listeners) {
+                if (ImGui::TreeNode(listener.second->field, "%s [Hits: %d [%d instructions]]", listener.second->field->get_name(), listener.second->hits, listener.second->instructions.size())) {
+                    for (auto& instruction : listener.second->instructions) {
+                        auto nearest_method = locate_nearest_method(instruction);
+
+                        if (nearest_method != nullptr) {
+                            attempt_display_method(nullptr, *nearest_method, true);
+                        } else {
+                            ImGui::Text("0x%p", instruction);
+                        }
+                    }
+
+                    ImGui::TreePop();
+                }
+            }
+        }
+
+        if (!open) {
+            m_veh_state.clear_all_hardware_breakpoints();
+        }
+    }
+
     if (!m_pinned_objects.empty()) {
         bool open = true;
 
@@ -645,7 +776,7 @@ void ObjectExplorer::on_frame() {
         // on_frame is just going to be a way to display
         // the pinned objects in a separate window
 
-        ImGui::SetNextWindowSize(ImVec2(400, 400), ImGuiCond_::ImGuiCond_Once);
+        ImGui::SetNextWindowSize(ImVec2(400, 800), ImGuiCond_::ImGuiCond_Once);
         if (ImGui::Begin("Hooked methods", &open)) {
             display_hooks();
 
@@ -685,9 +816,91 @@ void ObjectExplorer::display_pins() {
 }
 
 void ObjectExplorer::display_hooks() {
-    std::scoped_lock _{m_hooked_methods_mtx};
+    std::scoped_lock _{m_hooks_context.mtx};
 
+    ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+    if (ImGui::TreeNode("Options")) {
+        ImGui::Checkbox("Hide uncalled methods", &m_hooks_context.hide_uncalled_methods);
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Reset Stats")) {
+            for (auto& h : m_hooked_methods) {
+                h.reset_stats();
+            }
+        }
+
+        // Combobox of the sort method instead
+        if (ImGui::BeginCombo("Sort by", HooksContext::s_sort_method_names[(uint8_t)m_hooks_context.sort_method])) {
+            for (int i = 0; i < HooksContext::s_sort_method_names.size(); i++) {
+                const bool is_selected = (m_hooks_context.sort_method == (HooksContext::SortMethod)i);
+
+                if (ImGui::Selectable(HooksContext::s_sort_method_names[i], is_selected)) {
+                    m_hooks_context.sort_method = (HooksContext::SortMethod)i;
+                }
+
+                if (is_selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+
+            ImGui::EndCombo();
+        }
+
+        ImGui::TreePop();
+    }
+
+    std::vector<HookedMethod*> hooks_to_iterate{};
     for (auto& h : m_hooked_methods) {
+        if (m_hooks_context.hide_uncalled_methods && h.stats.call_count == 0) {
+            continue;
+        }
+
+        hooks_to_iterate.push_back(&h);
+    }
+
+    switch (m_hooks_context.sort_method) {
+    case HooksContext::SortMethod::CALL_COUNT:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->stats.call_count > b->stats.call_count;
+        });
+        break;
+    case HooksContext::SortMethod::CALL_TIME_LAST:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->stats.last_call_time > b->stats.last_call_time;
+        });
+        break;
+    case HooksContext::SortMethod::CALL_TIME_DELTA:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->stats.last_call_delta > b->stats.last_call_delta;
+        });
+        break;
+    case HooksContext::SortMethod::CALL_TIME_TOTAL:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->stats.total_call_time > b->stats.total_call_time;
+        });
+        break;
+    case HooksContext::SortMethod::METHOD_NAME:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->name < b->name;
+        });
+        break;
+    case HooksContext::SortMethod::NUMBER_OF_CALLERS:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->callers.size() > b->callers.size();
+        });
+        break;
+    case HooksContext::SortMethod::NUMBER_OF_THREADS_CALLED_FROM:
+        std::sort(hooks_to_iterate.begin(), hooks_to_iterate.end(), [](const auto& a, const auto& b) {
+            return a->stats.thread_ids.size() > b->stats.thread_ids.size();
+        });
+        break;
+    default:
+        break;
+    };
+
+    for (auto& hp : hooks_to_iterate) {
+        auto& h = *hp;
         ImGui::PushID(h.method);
 
         ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
@@ -696,31 +909,87 @@ void ObjectExplorer::display_hooks() {
 
         if (made_node) {
             ImGui::Checkbox("Skip function call", &h.skip);
-            ImGui::TextWrapped("Call count: %i", h.call_count);
-            if (ImGui::TreeNode("Callers")) {
-                for (auto& caller : h.callers) {
-                    const auto& context = h.callers_context[caller];
-                    const auto declaring_type = caller->get_declaring_type();
-                    //auto method_name = declaring_type != nullptr ? declaring_type->get_full_name() + "." + caller->get_name() : caller->get_name();
-                    //method_name += " [" + std::to_string(context.call_count) + "]";
-                    const auto call_count = std::string("[") + std::to_string(context.call_count) + "]";
+            ImGui::TextWrapped("Call count: %i", h.stats.call_count);
 
-                    ImGui::TextUnformatted(call_count.c_str());
-                    ImGui::SameLine();
-                    this->attempt_display_method(nullptr, *caller, true);
-                }
+            ImGui::SameLine();
+            const float delta_ms = std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(h.stats.last_call_delta).count();
+            const float total_ms = std::chrono::duration_cast<std::chrono::duration<float, std::milli>>(h.stats.total_call_time).count();
+            ImGui::TextWrapped("Time (ms): Delta %f, Total %f", delta_ms, total_ms);
 
-                ImGui::TreePop();
-            }
+            if (ImGui::TreeNode("Info")) {
+                ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
+                if (ImGui::TreeNode("Callers")) {
+                    // sort callers combo
+                    if (ImGui::BeginCombo("Sort Callers by", HookedMethod::s_sort_callers_names[(uint8_t)h.sort_callers_method])) {
+                        for (int i = 0; i < HookedMethod::s_sort_callers_names.size(); i++) {
+                            const bool is_selected = (h.sort_callers_method == (HookedMethod::SortCallersMethod)i);
 
-            if (ImGui::TreeNode("Return Addresses")) {
-                for (auto addr : h.return_addresses) {
-                    ImGui::Text("0x%p", addr);
+                            if (ImGui::Selectable(HookedMethod::s_sort_callers_names[i], is_selected)) {
+                                h.sort_callers_method = (HookedMethod::SortCallersMethod)i;
+                            }
 
-                    if (ImGui::IsItemClicked()) {
-                        ImGui::SetClipboardText((std::stringstream{} << std::hex << addr).str().c_str());
+                            if (is_selected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+
+                        ImGui::EndCombo();
                     }
+
+                    std::vector<sdk::REMethodDefinition*> callers_to_iterate{};
+
+                    for (auto& caller : h.callers) {
+                        callers_to_iterate.push_back(caller);
+                    }
+
+                    switch (h.sort_callers_method) {
+                    case HookedMethod::SortCallersMethod::CALL_COUNT:
+                        std::sort(callers_to_iterate.begin(), callers_to_iterate.end(), [&h](const auto& a, const auto& b) {
+                            return h.stats.callers_context[a].call_count > h.stats.callers_context[b].call_count;
+                        });
+                        break;
+                    case HookedMethod::SortCallersMethod::METHOD_NAME:
+                        std::sort(callers_to_iterate.begin(), callers_to_iterate.end(), [&h](const auto& a, const auto& b) {
+                            return a->get_name() < b->get_name();
+                        });
+                        break;
+                    default:
+                        break;
+                    };
+
+                    for (auto& caller : callers_to_iterate) {
+                        const auto& context = h.stats.callers_context[caller];
+                        const auto declaring_type = caller->get_declaring_type();
+                        //auto method_name = declaring_type != nullptr ? declaring_type->get_full_name() + "." + caller->get_name() : caller->get_name();
+                        //method_name += " [" + std::to_string(context.call_count) + "]";
+                        const auto call_count = std::string("[") + std::to_string(context.call_count) + "]";
+
+                        ImGui::TextUnformatted(call_count.c_str());
+                        ImGui::SameLine();
+                        this->attempt_display_method(nullptr, *caller, true);
+                    }
+
+                    ImGui::TreePop();
                 }
+
+                if (ImGui::TreeNode("Return Addresses")) {
+                    for (auto addr : h.return_addresses) {
+                        ImGui::Text("0x%p", addr);
+
+                        if (ImGui::IsItemClicked()) {
+                            ImGui::SetClipboardText((std::stringstream{} << std::hex << addr).str().c_str());
+                        }
+                    }
+                    ImGui::TreePop();
+                }
+
+                if (ImGui::TreeNode("Thread IDs")) {
+                    for (auto tid : h.stats.thread_ids) {
+                        ImGui::Text("%i", tid);
+                    }
+                    ImGui::TreePop();
+                }
+
                 ImGui::TreePop();
             }
 
@@ -849,7 +1118,7 @@ void ObjectExplorer::export_deserializer_chain(nlohmann::json& il2cpp_dump, sdk:
 }
 #endif
 
-void ObjectExplorer::generate_sdk() {
+void ObjectExplorer::generate_sdk(const bool skip_sdkgenny) {
     // enums
     //auto ref = utility::scan(g_framework->get_module().as<HMODULE>(), "66 C7 40 18 01 01 48 89 05 ? ? ? ?");
     //auto& l = *(std::map<uint64_t, REEnumData>*)(utility::calculate_absolute(*ref + 9));
@@ -942,6 +1211,16 @@ void ObjectExplorer::generate_sdk() {
         type_entry["name_hierarchy"] = t.get_name_hierarchy();
         type_entry["is_generic_type"] = t.is_generic_type();
         type_entry["is_generic_type_definition"] = t.is_generic_type_definition();
+
+#if TDB_VER >= 71
+        if (tdef->element_typeid_TBD != 0) {
+            type_entry["element_type_name"] = init_type(il2cpp_dump, tdb, tdef->element_typeid_TBD)->full_name;
+        }
+#elif TDB_VER >= 69
+        if (tdef->element_typeid != 0) {
+            type_entry["element_type_name"] = init_type(il2cpp_dump, tdb, tdef->element_typeid)->full_name;
+        }
+#endif
 
         if (auto gtd = t.get_generic_type_definition(); gtd != nullptr) {
             type_entry["generic_type_definition"] = gtd->get_full_name();
@@ -2092,9 +2371,11 @@ void ObjectExplorer::generate_sdk() {
 
     spdlog::info("Generating IDA SDK...");
     m_sdk_dump_stage = SdkDumpStage::GENERATE_SDK;
-    
-    genny::ida::transform(sdk);
-    sdk.generate("sdk_ida");
+
+    if (!skip_sdkgenny) {
+        genny::ida::transform(sdk);
+        sdk.generate("sdk_ida");
+    }
 
     // Free a couple gigabytes of no longer used memory
     g_stypedb.clear();
@@ -2152,7 +2433,7 @@ void ObjectExplorer::handle_address(Address address, int32_t offset, Address par
         context_menu(real_address);
 
         if (is_game_object) {
-            additional_text = utility::re_string::get_string(address.as<REGameObject*>()->name);
+            additional_text = utility::re_game_object::get_name(address.as<REGameObject*>());
         }
         else {
             // Change name based on VMType
@@ -2270,8 +2551,14 @@ void ObjectExplorer::handle_address(Address address, int32_t offset, Address par
         handle_type(object, utility::re_managed_object::get_type(object));
 
         if (utility::re_managed_object::get_vm_type(object) == via::clr::VMObjType::Array) {
-            if (ImGui::TreeNode(real_address.get(sizeof(REArrayBase)), "Array Entries")) {
-                auto arr = (REArrayBase*)object;
+            auto arr = (REArrayBase*)object;
+
+            const auto made_array_entries = ImGui::TreeNode(real_address.get(sizeof(REArrayBase)), "Array Entries");
+
+            ImGui::SameLine();
+            ImGui::Text("[%d]", arr->numElements);
+
+            if (made_array_entries) {
                 const bool entry_is_val = utility::re_array::get_contained_type(arr)->get_vm_obj_type() == via::clr::VMObjType::ValType;
 
                 if (entry_is_val) {
@@ -2364,7 +2651,9 @@ void ObjectExplorer::handle_game_object(REGameObject* game_object) {
         m_add_component_name.reserve(256);
     }
 
-    ImGui::Text("Name: %s", utility::re_string::get_string(game_object->name).c_str());
+    auto game_object_name = utility::re_game_object::get_name(game_object);
+
+    ImGui::Text("Name: %s", game_object_name.c_str());
     make_tree_offset(game_object, offsetof(REGameObject, transform), "Transform");
     make_tree_offset(game_object, offsetof(REGameObject, folder), "Folder");
 
@@ -2375,7 +2664,7 @@ void ObjectExplorer::handle_component(REComponent* component) {
     auto display_component_preview = [&](REComponent* comp) {
         if (comp != nullptr && comp->ownerGameObject != nullptr) {
             auto prev_name = utility::re_managed_object::get_type_name(comp);
-            auto prev_gameobject_name = utility::re_string::get_string(comp->ownerGameObject->name);
+            auto prev_gameobject_name = utility::re_game_object::get_name(comp->ownerGameObject);
 
             auto tree_hovered = ImGui::IsItemHovered();
 
@@ -2905,6 +3194,8 @@ void ObjectExplorer::display_native_fields(REManagedObject* obj, sdk::RETypeDefi
 
             std::vector<std::string> postfixes{};
 
+            void* ptr_to_data{nullptr};
+
             // Handle static fields
             if ((field_flags & (uint16_t)via::clr::FieldFlag::Static) != 0) {
                 postfixes.push_back("STATIC");
@@ -2914,6 +3205,7 @@ void ObjectExplorer::display_native_fields(REManagedObject* obj, sdk::RETypeDefi
                     postfixes.push_back("CONST");
 
                     data = f->get_init_data();
+                    ptr_to_data = data;
 
                     switch (utility::hash(field_type_name)) {
                     case "System.String"_fnv:
@@ -2926,6 +3218,7 @@ void ObjectExplorer::display_native_fields(REManagedObject* obj, sdk::RETypeDefi
                 }
                 else {
                     data = f->get_data_raw();
+                    ptr_to_data = data;
 
                     if (data != nullptr && !is_valuetype) {
                         data = *(void**)data;
@@ -2942,6 +3235,7 @@ void ObjectExplorer::display_native_fields(REManagedObject* obj, sdk::RETypeDefi
 
                 if (obj != nullptr) {
                     data = Address{ obj }.get(offset);
+                    ptr_to_data = data;
 
                     if (!is_valuetype) {
                         data = *(void**)data;
@@ -2951,7 +3245,15 @@ void ObjectExplorer::display_native_fields(REManagedObject* obj, sdk::RETypeDefi
 
             is_managed_str = final_type_name == "System.String";
 
-            const auto made_node = widget_with_context(data, field_name, [&]() { return stretched_tree_node(f, "%s", field_type_name.c_str()); });
+            const auto made_node = widget_with_context(data, field_name, 
+                [&]() { return stretched_tree_node(f, "%s", field_type_name.c_str()); },
+                [&]() {
+                    if (is_real_object && ptr_to_data != nullptr && ImGui::Selectable("Listen for reads")) {
+                        install_veh();
+                        m_veh_state.add_read_listener((uintptr_t)data, f);
+                    }
+                }
+            );
             const auto tree_hovered = ImGui::IsItemHovered();
 
             // Draw the variable name with a color
@@ -2982,7 +3284,70 @@ void ObjectExplorer::display_native_fields(REManagedObject* obj, sdk::RETypeDefi
 //#endif
 }
 
+void ObjectExplorer::populate_method_meta_info(sdk::REMethodDefinition& m) {
+    const auto method_ptr = m.get_function();
+
+    if (method_ptr == nullptr) {
+        return;
+    }
+
+    if (m_method_meta_infos.contains((uintptr_t)method_ptr)) {
+        return;
+    }
+
+    m_method_meta_infos[(uintptr_t)method_ptr] = std::make_unique<MethodMetaInfo>();
+
+    if (IsBadReadPtr(method_ptr, sizeof(void*))) {
+        return;
+    }
+
+    std::unordered_set<sdk::REMethodDefinition*> called_functions{};
+
+    // Disassemble the function's instructions looking for calls to other functions, and add them to the list of methods this function calls
+    utility::exhaustive_decode((uint8_t*)method_ptr, 5000, [&](utility::ExhaustionContext& ctx) -> utility::ExhaustionResult {
+        if (ctx.addr != (uintptr_t)method_ptr) {
+            if (auto it = m_method_map.find(ctx.addr); it != m_method_map.end()) {
+                called_functions.insert(it->second);
+            }
+        }
+
+        if (std::string_view{ctx.instrux.Mnemonic}.starts_with("CALL")) {
+            const auto resolved_addr = utility::resolve_displacement(ctx.addr);
+
+            if (resolved_addr) {
+                if (auto it = m_method_map.find(*resolved_addr); it != m_method_map.end()) {
+                    called_functions.insert(it->second);
+                }
+            }
+
+            // Step over all calls, we don't want to go down a rabbit hole that freezes the program
+            return utility::ExhaustionResult::STEP_OVER;
+        }
+
+        return utility::ExhaustionResult::CONTINUE;
+    });
+
+    for (auto& called_function : called_functions) {
+        m_method_meta_infos[(uintptr_t)method_ptr]->called_functions.push_back(called_function);
+    }
+
+    std::sort(
+        m_method_meta_infos[(uintptr_t)method_ptr]->called_functions.begin(), 
+        m_method_meta_infos[(uintptr_t)method_ptr]->called_functions.end(), 
+        [](sdk::REMethodDefinition* a, sdk::REMethodDefinition* b) 
+    {
+        const auto decltype_a = a->get_declaring_type();
+        const auto decltype_b = b->get_declaring_type();
+        const auto fullname_a = decltype_a != nullptr ? decltype_a->get_full_name() + "." + a->get_name() : a->get_name();
+        const auto fullname_b = decltype_b != nullptr ? decltype_b->get_full_name() + "." + b->get_name() : b->get_name();
+        
+        return fullname_a < fullname_b;
+    });
+}
+
 void ObjectExplorer::attempt_display_method(REManagedObject* obj, sdk::REMethodDefinition& m, bool use_full_name) {
+    populate_method_meta_info(m);
+
     const auto declaring_type = m.get_declaring_type();
     const auto method_name = (use_full_name && declaring_type != nullptr) ? declaring_type->get_full_name() + "." + m.get_name() : m.get_name();
     const auto method_return_type = m.get_return_type();
@@ -3120,6 +3485,21 @@ void ObjectExplorer::attempt_display_method(REManagedObject* obj, sdk::REMethodD
 
                 ImGui::EndTable();
             }
+        }
+
+        if (ImGui::BeginTable("##calls", 1,  ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable)) {
+            ImGui::TableNextColumn();
+            ImGui::Text("Called Method");
+
+            // Show a list of methods this method calls
+            if (m_method_meta_infos.contains((uintptr_t)method_ptr)) {
+                for (const auto& called_m : m_method_meta_infos[(uintptr_t)method_ptr]->called_functions) {
+                    ImGui::TableNextColumn();
+                    attempt_display_method(nullptr, *called_m, true);
+                }
+            }
+
+            ImGui::EndTable();
         }
 
         if (ImGui::BeginTable("##disassembly", 3,  ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable)) {
@@ -3270,12 +3650,12 @@ void ObjectExplorer::attempt_display_field(REManagedObject* obj, VariableDescrip
             const auto should_pass_result_ptr = result_type != nullptr && result_type->is_value_type() && (result_type->get_valuetype_size() > sizeof(void*) || (!result_type->is_primitive() && !result_type->is_enum()));
 
             if (result_type == nullptr) {
-                setter->invoke(obj, {dummy_data.ptr});
+                setter->invoke(obj, dummy_data.ptr);
             } else {
                 if (should_pass_result_ptr) {
-                    setter->invoke(obj, {dummy_data.bytes.data()});
+                    setter->invoke(obj, (void*)dummy_data.bytes.data());
                 } else {
-                    setter->invoke(obj, {dummy_data.ptr});
+                    setter->invoke(obj, dummy_data.ptr);
                 }
             }
         }
@@ -3359,7 +3739,7 @@ void ObjectExplorer::display_data(void* data, void* real_data, std::string type_
         if (real_data != nullptr) {
             auto& int_val = *(uint32_t*)real_data;
 
-            ImGui::DragInt("Set Value", (int*)&int_val, 1.0f, min_uint, max_uint);
+            ImGui::DragScalar("Set Value", ImGuiDataType_U32, &int_val, 1.0f, &min_uint, &max_uint);
         }
 
         break;
@@ -3772,16 +4152,16 @@ int32_t ObjectExplorer::get_field_offset(REManagedObject* obj, VariableDescripto
     return m_offset_map[desc];
 }
 
-bool ObjectExplorer::widget_with_context(void* address, std::function<bool()> widget) {
+bool ObjectExplorer::widget_with_context(void* address, std::function<bool()> widget, std::optional<std::function<void()>> additional_context) {
     auto ret = widget();
-    context_menu(address);
+    context_menu(address, std::nullopt, additional_context);
 
     return ret;
 }
 
-bool ObjectExplorer::widget_with_context(void* address, const std::string& name, std::function<bool()> widget) {
+bool ObjectExplorer::widget_with_context(void* address, const std::string& name, std::function<bool()> widget, std::optional<std::function<void()>> additional_context) {
     auto ret = widget();
-    context_menu(address, name);
+    context_menu(address, name, additional_context);
 
     return ret;
 }
@@ -3830,7 +4210,7 @@ void ObjectExplorer::context_menu(void* address, std::optional<std::string> name
                     }
                     else {
                         auto owner = obj->ownerGameObject;
-                        spdlog::info("[{:s}] {:s} ({:x})", utility::re_string::get_string(owner->name), t->name, (uintptr_t)obj);
+                        spdlog::info("[{:s}] {:s} ({:x})", utility::re_game_object::get_name(owner), t->name, (uintptr_t)obj);
                     }
                 }
 
@@ -3864,23 +4244,6 @@ void ObjectExplorer::hook_method(sdk::REMethodDefinition* method, std::optional<
     }
 
     auto& hooked = m_hooked_methods.emplace_back();
-
-    using namespace asmjit;
-    using namespace asmjit::x86;
-
-    CodeHolder code{};
-    code.init(m_jit_runtime.environment());
-
-    Assembler a{&code};
-
-    a.mov(r9, method);
-    a.movabs(r10, &ObjectExplorer::pre_hooked_method);
-    a.jmp(r10);
-
-    m_jit_runtime.add(&hooked.jitted_function, &code);
-
-    using MT = HookManager::PreHookResult(*)(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
-
     hooked.method = method;
 
     if (name) {
@@ -3888,8 +4251,40 @@ void ObjectExplorer::hook_method(sdk::REMethodDefinition* method, std::optional<
     } else {
         hooked.name = method->get_declaring_type()->get_full_name() + "." + method->get_name();
     }
+
+    using namespace asmjit;
+    using namespace asmjit::x86;
+
+    // Pre
+    {
+        CodeHolder code{};
+        code.init(m_jit_runtime.environment());
+        Assembler a{&code};
+
+        a.mov(r9, method);
+        a.movabs(r10, &ObjectExplorer::pre_hooked_method);
+        a.jmp(r10);
+
+        m_jit_runtime.add(&hooked.jitted_function, &code);
+    }
+
+    // Post
+    {
+        CodeHolder code{};
+        code.init(m_jit_runtime.environment());
+        Assembler a{&code};
+
+        a.mov(r9, method);
+        a.movabs(r10, &ObjectExplorer::post_hooked_method);
+        a.jmp(r10);
+
+        m_jit_runtime.add(&hooked.jitted_function_post, &code);
+    }
     
-    hooked.hook_id = g_hookman.add(method, (MT)hooked.jitted_function, nullptr);
+    using MT = HookManager::PreHookResult(*)(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
+    using MTPost = void (*)(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr);
+
+    hooked.hook_id = g_hookman.add(method, (MT)hooked.jitted_function, (MTPost)hooked.jitted_function_post);
 }
 
 void ObjectExplorer::hook_all_methods(sdk::RETypeDefinition* t) {
@@ -4013,6 +4408,8 @@ void ObjectExplorer::populate_classes() {
     auto type_list = reframework::get_types()->get_raw_types();
     spdlog::info("TypeList: {:x}", (uintptr_t)type_list);
 
+    std::unordered_set<REType*> seen{};
+
     if (type_list != nullptr) try {
         // I don't know why but it can extend past the size.
         for (auto i = 0; i < type_list->numAllocated; ++i) {
@@ -4026,6 +4423,10 @@ void ObjectExplorer::populate_classes() {
                 continue;
             }
 
+            if (seen.contains(t)) {
+                continue;
+            }
+
             auto name = std::string{ t->name };
 
             if (name.empty()) {
@@ -4035,6 +4436,8 @@ void ObjectExplorer::populate_classes() {
             spdlog::info("{:s}", name);
             m_sorted_types.push_back(name);
             m_types[name] = t;
+
+            seen.insert(t);
         }
 
         std::sort(m_sorted_types.begin(), m_sorted_types.end());
@@ -4044,8 +4447,6 @@ void ObjectExplorer::populate_classes() {
     }
 
     auto tdb = sdk::RETypeDB::get();
-
-    std::unordered_set<REType*> seen{};
 
     if (tdb != nullptr) {
         for (auto i = 0; i < tdb->get_num_types(); ++i) {
@@ -4143,6 +4544,9 @@ void ObjectExplorer::populate_enums() {
         std::vector<sdk::RETypeDefinition*> enum_types{};
         auto tdb = sdk::RETypeDB::get();
 
+        const auto flags_attribute = tdb->find_type("System.FlagsAttribute");
+        const auto flags_attribute_runtime_type = flags_attribute != nullptr ? flags_attribute->get_runtime_type() : nullptr;
+
         for (uint32_t i = 0; i < tdb->numTypes; ++i) {
             auto t = tdb->get_type(i);
             auto parent_t = t->get_parent_type();
@@ -4170,6 +4574,11 @@ void ObjectExplorer::populate_enums() {
                 }
 
                 out_file << "namespace " << nspace << " {" << std::endl;
+                
+                if (flags_attribute_runtime_type != nullptr && t->has_attribute(flags_attribute_runtime_type, true)) {
+                    out_file << "    // [Flags]" << std::endl;
+                }
+
                 out_file << "    enum " << name << " {" << std::endl;
 
                 spdlog::info("ENUM {}", t->get_full_name().c_str());
@@ -4245,6 +4654,348 @@ void ObjectExplorer::init() {
             m_function_occurrences[func]++;
         }
     }
+}
+
+void ObjectExplorer::install_veh() {
+    if (m_veh_installed) {
+        return;
+    }
+
+    spdlog::info("[ObjectExplorer] Istalling VEH");
+
+    m_veh_installed = true;
+    m_veh_state.veh_handle = AddVectoredExceptionHandler(1, exception_handler_veh);
+
+    spdlog::info("[ObjectExplorer] VEH Installed: {}", m_veh_state.veh_handle != nullptr);
+}
+
+void ObjectExplorer::VEHState::set_guard_page_protections(uintptr_t address) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    VirtualQuery((LPCVOID)address, &mbi, sizeof(mbi));
+
+    if ((mbi.Protect & PAGE_NOACCESS) != 0 || (mbi.Protect & PAGE_GUARD) != 0) {
+        return;
+    }
+
+    std::unique_lock _{this->guard_page_mtx};
+
+    auto guarded_page = get_guarded_page_unsafe(address);
+
+    if (guarded_page == nullptr) {
+        // Add one
+        auto page = std::make_shared<GuardedPage>();
+        page->mbi = mbi;
+
+        this->guarded_pages.push_back(std::move(page));
+        guarded_page = this->guarded_pages.back();
+
+        VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_EXECUTE_READWRITE, &guarded_page->old_protect);
+    }
+
+    DWORD old_protect{};
+    VirtualProtect(mbi.BaseAddress, mbi.RegionSize, guarded_page->old_protect | PAGE_GUARD, &old_protect);
+}
+
+void ObjectExplorer::VEHState::set_hardware_breakpoint(uintptr_t address, bool read, bool write) {
+    // Check this thread for which debug registers are available
+    auto this_thread = GetCurrentThread();
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    if (GetThreadContext(this_thread, &ctx) == FALSE) {
+        return;
+    }
+
+    std::optional<size_t> available_dr{};
+
+    for (auto i = 0; i < 4; ++i) {
+        auto dr = &ctx.Dr0 + i;
+        const auto actual_dr_in_use = ctx.Dr7 & (1 << (i * 2));
+        if (*dr == 0 && actual_dr_in_use == 0) {
+            available_dr = i;
+            break;
+        }
+    }
+
+    if (!available_dr.has_value()) {
+        return;
+    }
+
+    std::unique_lock _{this->hardware_breakpoint_mtx};
+
+    auto bpit = this->hardware_breakpoints.find(address);
+    std::shared_ptr<HardwareBreakpoint> bp{};
+
+    if (bpit == this->hardware_breakpoints.end()) {
+        bp = std::make_shared<HardwareBreakpoint>();
+        bp->address = address;
+        bp->read = read;
+        bp->write = write;
+
+        this->hardware_breakpoints[address] = bp;
+    } else {
+        bp = bpit->second;
+    }
+
+    bp->debug_register = *available_dr;
+
+    auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+
+    const auto pid = GetCurrentProcessId();
+
+    if (Thread32First(snapshot, &te) == FALSE) {
+        CloseHandle(snapshot);
+        return;
+    }
+
+    do {
+        if (te.th32OwnerProcessID != pid) {
+            continue;
+        }
+
+        auto thread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+
+        if (thread == nullptr) {
+            continue;
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+        if (GetThreadContext(thread, &ctx) == FALSE) {
+            CloseHandle(thread);
+            continue;
+        }
+
+        const auto i = *available_dr;
+
+        auto dr = &ctx.Dr0 + i;
+        *dr = address;
+
+        // Set which debug breakpoint to use
+        ctx.Dr7 |= (1 << (i * 2));
+
+        int32_t condition = (write ? 1 : 0) | (read ? 2 : 0);
+        // 00 = execute, 01 = write, 11 = read/write
+        ctx.Dr7 &= ~(0x3 << (16 + (i * 4)));
+        ctx.Dr7 |= (condition << (16 + (i * 4)));
+        
+        int32_t len = 1; // TODO?
+        ctx.Dr7 &= ~(0x3 << (18 + (i * 4)));
+        ctx.Dr7 |= (len << (18 + (i * 4)));
+
+        SetThreadContext(thread, &ctx);
+        CloseHandle(thread);
+    } while (Thread32Next(snapshot, &te));
+
+    CloseHandle(snapshot);
+}
+
+void ObjectExplorer::VEHState::clear_all_hardware_breakpoints() {
+    // Clear internal tracking map
+    std::unique_lock _{this->hardware_breakpoint_mtx};
+    this->hardware_breakpoints.clear();
+
+    {
+        std::unique_lock __{this->listener_mtx};
+        this->read_listeners.clear();
+        this->write_listeners.clear();
+    }
+    
+    // Get a snapshot of all threads
+    auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    const auto pid = GetCurrentProcessId();
+    
+    if (Thread32First(snapshot, &te) == FALSE) {
+        CloseHandle(snapshot);
+        return;
+    }
+
+    do {
+        if (te.th32OwnerProcessID != pid) {
+            continue;
+        }
+
+        auto thread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+        if (thread == nullptr) {
+            continue;
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        
+        if (GetThreadContext(thread, &ctx) == FALSE) {
+            CloseHandle(thread);
+            continue;
+        }
+
+        ctx.Dr0 = 0;
+        ctx.Dr1 = 0;
+        ctx.Dr2 = 0;
+        ctx.Dr3 = 0;
+        ctx.Dr7 = 0;
+        
+        SetThreadContext(thread, &ctx);
+        CloseHandle(thread);
+    } while (Thread32Next(snapshot, &te));
+    
+    CloseHandle(snapshot);
+}
+
+void ObjectExplorer::VEHState::add_read_listener(uintptr_t address, sdk::REField* field) {
+    {
+        std::shared_lock _{this->listener_mtx};
+
+        if (auto it = read_listeners.find(address); it != read_listeners.end()) {
+            return;
+        }
+    }
+
+    std::unique_lock _{this->listener_mtx};
+    auto listener = std::make_unique<VEHState::Listener>();
+    listener->address = address;
+    listener->field = field;
+
+    read_listeners[address] = std::move(listener);
+
+    switch (this->breakpoint_method) {
+    case BreakpointMethod::GUARD_PAGE: 
+    {
+        set_guard_page_protections(address);
+
+        auto guarded_page = get_guarded_page(address);
+    
+        if (guarded_page != nullptr) {
+            ++guarded_page->num_references;
+        }
+
+        break;
+    }
+
+    case BreakpointMethod::HARDWARE:
+    {
+        set_hardware_breakpoint(address, true, true);
+        break;
+    }
+
+    default:
+        break;
+    };
+}
+
+void ObjectExplorer::VEHState::remove_read_listener(uintptr_t address) {
+    std::unique_lock _{this->listener_mtx};
+
+    if (auto it = read_listeners.find(address); it != read_listeners.end()) {
+        read_listeners.erase(it);
+
+        std::unique_lock __{this->guard_page_mtx};
+        if (auto guarded_page = get_guarded_page_unsafe(address); guarded_page != nullptr) {
+            if (--guarded_page->num_references == 0) {
+                DWORD old_protect{};
+                VirtualProtect(guarded_page->mbi.BaseAddress, guarded_page->mbi.RegionSize, guarded_page->old_protect, &old_protect);
+
+                // Remove entry
+                std::erase_if(guarded_pages, [&](auto& page) { return page == guarded_page; });
+            }
+        }
+    }
+}
+
+void ObjectExplorer::VEHState::display_listeners() {
+
+}
+
+LONG ObjectExplorer::exception_handler_veh_internal(_EXCEPTION_POINTERS* ex) {
+    if (ex->ExceptionRecord == nullptr || ex->ContextRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto thread_id = GetCurrentThreadId();
+
+    // Check if this address is within our guard page and reset it
+    if (ex->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+        const auto address_that_was_accessed = (uintptr_t)ex->ExceptionRecord->ExceptionInformation[1];
+        auto guarded_page = m_veh_state.get_guarded_page(address_that_was_accessed);
+
+        if (guarded_page != nullptr) {
+            {
+                std::unique_lock _{m_veh_state.single_step_mtx};
+                m_veh_state.single_step_pages[GetCurrentThreadId()] = guarded_page;
+            }
+
+            std::unique_lock __{m_veh_state.listener_mtx};
+            auto read_listener = m_veh_state.read_listeners.find(address_that_was_accessed);
+            auto write_listener = m_veh_state.write_listeners.find(address_that_was_accessed);
+
+            if (read_listener != m_veh_state.read_listeners.end()) {
+                ++read_listener->second->hits;
+                read_listener->second->instructions.insert((uintptr_t)ex->ExceptionRecord->ExceptionAddress);
+            }
+        
+            // TODO: Differentiate between read and write listeners
+            if (write_listener != m_veh_state.write_listeners.end()) {
+                ++write_listener->second->hits;
+                write_listener->second->instructions.insert((uintptr_t)ex->ExceptionRecord->ExceptionAddress);
+            }
+
+            ex->ContextRecord->EFlags |= 0x100; // trap flag to single step
+
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // Not our problem?
+        return EXCEPTION_CONTINUE_SEARCH;
+    } else if (ex->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        auto guarded_page = m_veh_state.pop_single_step_thread(thread_id);
+
+        if (guarded_page != nullptr) {
+            const auto& mbi = guarded_page->mbi;
+            VirtualProtect(mbi.BaseAddress, mbi.RegionSize, guarded_page->old_protect | PAGE_GUARD, &guarded_page->old_protect);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        std::shared_lock _{m_veh_state.hardware_breakpoint_mtx};
+        std::unique_lock __{m_veh_state.listener_mtx};
+        
+        // Check if any debug registers point to our address
+        for (auto& [address, bp] : m_veh_state.hardware_breakpoints) {
+            for (auto i = 0; i < 4; ++i) {
+                const auto dr = &ex->ContextRecord->Dr0 + i;
+                const auto bp_hit = (ex->ContextRecord->Dr6 & (1 << i)) != 0;
+                if (*dr == bp->address && bp->read && bp_hit) {
+                    auto listener = m_veh_state.read_listeners.find(address);
+
+                    if (listener != m_veh_state.read_listeners.end()) {
+                        ++listener->second->hits;
+                        listener->second->instructions.insert((uintptr_t)ex->ExceptionRecord->ExceptionAddress);
+                    }
+
+                    // Clear DR6
+                    ex->ContextRecord->Dr6 &= ~(1 << i);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG ObjectExplorer::exception_handler_veh(_EXCEPTION_POINTERS* ex) {
+    return ObjectExplorer::get()->exception_handler_veh_internal(ex);
 }
 
 std::string ObjectExplorer::get_full_enum_value_name(std::string_view enum_name, int64_t value) {
@@ -4446,6 +5197,39 @@ bool ObjectExplorer::is_filtered_field(sdk::REField& f) try {
     return false;
 }
 
+sdk::REMethodDefinition* ObjectExplorer::locate_nearest_method(uintptr_t instruction) {
+    static thread_local std::unordered_map<uintptr_t, sdk::REMethodDefinition*> method_map{};
+    if (auto it = method_map.find(instruction); it != method_map.end()) {
+        return it->second;
+    }
+
+    auto unwound_function_start = utility::find_function_start_unwind(instruction);
+    if (!unwound_function_start) {
+        unwound_function_start = instruction;
+    }
+
+    size_t nearest_distance = UINT64_MAX;
+    sdk::REMethodDefinition* nearest_method{nullptr};
+
+    const auto search = *unwound_function_start;
+
+    for (auto& it : m_method_map) {
+        if (it.first > search) {
+            continue;
+        }
+
+        const auto distance = search - it.first;
+        if (distance < nearest_distance) {
+            nearest_distance = distance;
+            nearest_method = it.second;
+        }
+    }
+
+    method_map[instruction] = nearest_method;
+
+    return nearest_method;
+}
+
 HookManager::PreHookResult ObjectExplorer::pre_hooked_method_internal(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr, sdk::REMethodDefinition* method) {
     auto it = std::find_if(m_hooked_methods.begin(), m_hooked_methods.end(), [method](auto& a) { return a.method == method; });
 
@@ -4455,48 +5239,64 @@ HookManager::PreHookResult ObjectExplorer::pre_hooked_method_internal(std::vecto
 
     auto& hooked_method = *it;
 
-    std::scoped_lock _{m_hooked_methods_mtx};
-    ++hooked_method.call_count;
+    std::scoped_lock _{m_hooks_context.mtx};
+    ++hooked_method.stats.call_count;
 
     if (!hooked_method.return_addresses.contains(ret_addr)) {
         spdlog::info("Creating new entry for {}", hooked_method.name);
 
         hooked_method.return_addresses.insert(ret_addr);
         // Try to locate the containing function from the return address
-        sdk::REMethodDefinition* nearest_method{nullptr};
-        size_t nearest_distance = UINT64_MAX;
-
-        for (auto& it : m_method_map) {
-            const auto distance = std::abs(static_cast<int64_t>(it.first - ret_addr));
-            if (distance < nearest_distance) {
-                nearest_distance = distance;
-                nearest_method = it.second;
-            }
-        }
+        auto nearest_method = locate_nearest_method(ret_addr);
 
         if (nearest_method != nullptr) {
             auto method_entry = utility::find_function_entry((uintptr_t)nearest_method->get_function());
+
+            bool added = false;
+            auto add_method = [&]() {
+                hooked_method.return_addresses_to_methods[ret_addr] = nearest_method;
+                hooked_method.callers.insert(nearest_method);
+
+                const auto decl_type = nearest_method->get_declaring_type();
+
+                if (decl_type != nullptr) {
+                    spdlog::info("{} {}.{}", hooked_method.name, nearest_method->get_declaring_type()->get_full_name(), nearest_method->get_name());
+                } else {
+                    spdlog::info("{} {}", hooked_method.name, nearest_method->get_name());
+                }
+
+                added = true;
+            };
 
             if (method_entry != nullptr) {
                 const auto module_addr = (uintptr_t)utility::get_module_within(ret_addr).value_or(nullptr);
                 const auto ret_addr_rva = (uint32_t)(ret_addr - module_addr);
                 const auto ret_addr_entry = utility::find_function_entry(ret_addr);
+
+                // First condition isn't as heavy as fully disassembling the function which is the second condition
                 if (ret_addr_entry == method_entry ||
                     (ret_addr_rva >= method_entry->BeginAddress && ret_addr_rva <= method_entry->EndAddress) ||
                     (ret_addr_entry != nullptr && ret_addr_entry->BeginAddress >= method_entry->BeginAddress && ret_addr_entry->BeginAddress <= method_entry->EndAddress + 1))
                 {
-                    hooked_method.return_addresses_to_methods[ret_addr] = nearest_method;
-                    hooked_method.callers.insert(nearest_method);
-
-                    const auto decl_type = nearest_method->get_declaring_type();
-
-                    if (decl_type != nullptr) {
-                        spdlog::info("{} {}.{}", hooked_method.name, nearest_method->get_declaring_type()->get_full_name(), nearest_method->get_name());
-                    } else {
-                        spdlog::info("{} {}", hooked_method.name, nearest_method->get_name());
-                    }
+                    add_method();
                 } else {
-                    spdlog::info("{} <unknown caller> @ 0x{:x}", hooked_method.name, ret_addr);
+                    // Disassemble all possible code paths to see if we run into the return address
+                    utility::exhaustive_decode((uint8_t*)nearest_method->get_function(), 5000, [&](utility::ExhaustionContext& ctx) -> utility::ExhaustionResult {
+                        if (ctx.addr == ret_addr) {
+                            add_method();
+                            return utility::ExhaustionResult::BREAK;
+                        }
+
+                        if (std::string_view{ctx.instrux.Mnemonic}.starts_with("CALL")) {
+                            return utility::ExhaustionResult::STEP_OVER;
+                        }
+
+                        return utility::ExhaustionResult::CONTINUE;
+                    });
+
+                    if (!added) {
+                        spdlog::info("{} <unknown caller> @ 0x{:x}", hooked_method.name, ret_addr);
+                    }
                 }
             } else {
                 hooked_method.return_addresses_to_methods[ret_addr] = nearest_method;
@@ -4516,9 +5316,15 @@ HookManager::PreHookResult ObjectExplorer::pre_hooked_method_internal(std::vecto
 
     if (auto it2 = hooked_method.return_addresses_to_methods.find(ret_addr); it2 != hooked_method.return_addresses_to_methods.end()) {
         auto caller = it2->second;
-        auto& context = hooked_method.callers_context[caller];
+        auto& context = hooked_method.stats.callers_context[caller];
         ++context.call_count;
     }
+
+    const auto tid = std::this_thread::get_id();
+    const auto now = std::chrono::high_resolution_clock::now();
+    hooked_method.stats.last_call_time = now;
+    hooked_method.stats.last_call_times[tid] = now;
+    hooked_method.stats.thread_ids.insert(tid._Get_underlying_id());
 
     auto result = HookManager::PreHookResult::CALL_ORIGINAL;
 
@@ -4531,4 +5337,36 @@ HookManager::PreHookResult ObjectExplorer::pre_hooked_method_internal(std::vecto
 
 HookManager::PreHookResult ObjectExplorer::pre_hooked_method(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr, sdk::REMethodDefinition* method) {
     return ObjectExplorer::get()->pre_hooked_method_internal(args, arg_tys, ret_addr, method);
+}
+
+void ObjectExplorer::post_hooked_method_internal(uintptr_t& ret_val, sdk::RETypeDefinition*& ret_ty, uintptr_t ret_addr, sdk::REMethodDefinition* method) {
+    auto it = std::find_if(m_hooked_methods.begin(), m_hooked_methods.end(), [method](auto& a) { return a.method == method; });
+
+    if (it == m_hooked_methods.end()) {
+        return;
+    }
+
+    const auto now = std::chrono::high_resolution_clock::now();
+
+    auto& hooked_method = *it;
+
+    std::scoped_lock _{m_hooks_context.mtx};
+
+    // Reset the last call time if this is the first time we're calling it
+    // because in between this, there will be a large hitch
+    // that the game is not causing.
+    if (hooked_method.stats.call_count <= 1) {
+        hooked_method.stats.last_call_time = now;
+    }
+
+    const auto tid = std::this_thread::get_id();
+
+    hooked_method.stats.last_call_end_time = now;
+    const auto delta = now - hooked_method.stats.last_call_times[tid];
+    hooked_method.stats.last_call_delta = delta;
+    hooked_method.stats.total_call_time += delta;
+}
+
+void ObjectExplorer::post_hooked_method(uintptr_t& ret_val, sdk::RETypeDefinition*& ret_ty, uintptr_t ret_addr, sdk::REMethodDefinition* method) {
+    ObjectExplorer::get()->post_hooked_method_internal(ret_val, ret_ty, ret_addr, method);
 }

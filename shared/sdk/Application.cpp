@@ -43,7 +43,24 @@ Application::Function* Application::get_functions() {
             const auto candidate = *(int32_t*)(*ref + 12) - 8;
 
             // If the offset is aligned to 8 bytes, it's a valid offset.
-            if (((uintptr_t)candidate & (sizeof(void*) - 1)) == 0 && candidate >= 0x400) {
+            if (((uintptr_t)candidate & (sizeof(void*) - 1)) == 0 && candidate >= 0x400 && candidate < 0x5000) {
+                try {
+                    const auto ptr = (Application::Function*)((uintptr_t)this + candidate);
+
+                    if (ptr == nullptr || IsBadReadPtr(ptr, sizeof(Application::Function) * 50)) {
+                        spdlog::info("Skipping invalid Application::functions offset: {:x}", candidate);
+                        continue;
+                    }
+
+                    if (ptr->description == nullptr || IsBadReadPtr(ptr->description, 32)) {
+                        spdlog::info("Skipping invalid Application::functions offset: {:x}", candidate);
+                        continue;
+                    }
+                } catch (...) {
+                    spdlog::info("Skipping invalid Application::functions offset: {:x}", candidate);
+                    continue;
+                }
+
                 spdlog::info("Application::functions offset: {:x}", candidate);
                 return candidate;
             }
@@ -64,7 +81,24 @@ Application::Function* Application::get_functions() {
             const auto candidate = *(int32_t*)(*ref + 10);
 
             // If the offset is aligned to 8 bytes, it's a valid offset.
-            if (((uintptr_t)candidate & (sizeof(void*) - 1)) == 0 && candidate >= 0x400) {
+            if (((uintptr_t)candidate & (sizeof(void*) - 1)) == 0 && candidate >= 0x400 && candidate < 0x5000) {
+                try {
+                    const auto ptr = (Application::Function*)((uintptr_t)this + candidate);
+
+                    if (ptr == nullptr || IsBadReadPtr(ptr, sizeof(Application::Function) * 50)) {
+                        spdlog::info("Skipping invalid Application::functions offset: {:x}", candidate);
+                        continue;
+                    }
+
+                    if (ptr->description == nullptr || IsBadReadPtr(ptr->description, 32)) {
+                        spdlog::info("Skipping invalid Application::functions offset: {:x}", candidate);
+                        continue;
+                    }
+                } catch (...) {
+                    spdlog::info("Skipping invalid Application::functions offset: {:x}", candidate);
+                    continue;
+                }
+
                 spdlog::info("Application::functions offset: {:x}", candidate);
                 return candidate;
             }
@@ -77,6 +111,10 @@ Application::Function* Application::get_functions() {
         bool found_end_rendering = false;
 
         const auto module_entry_enum = sdk::find_type_definition("via.ModuleEntry");
+
+        if (module_entry_enum == nullptr) {
+            spdlog::error("Cannot find via.ModuleEntry");
+        }
 
         // screw that lets just bruteforce through the Application object looking for huge
         // list of valid pointers within the current module
@@ -97,14 +135,17 @@ Application::Function* Application::get_functions() {
                 if (j == 0 && func.entry == nullptr || IsBadReadPtr(func.entry, sizeof(void*))) {
                     break; // the first one should always be valid.
                 }
-
+                
                 const auto name = std::string_view{func.description};
 
                 if (j == 0) {
                     if (module_entry_enum != nullptr) {
                         if (auto f = sdk::get_native_field<uint16_t>(nullptr, module_entry_enum, name, true); f != nullptr) {
                             if (*f != func.priority) {
+                                spdlog::error("{} priority mismatch: {} != {}", name.data(), *f, func.priority);
                                 break; // the first one should always be valid.
+                            } else{
+                                spdlog::info("{} priority match: {} == {}", name.data(), *f, func.priority);
                             }
                         }
                     } else if (func.priority != 1) {

@@ -23,150 +23,74 @@ FILL_BYTE = 16
 
 zero_member_functions = {}
 
+hardcoded_jointexprgraphlayer = [
+    {
+        "align": 4,
+        "element": None,
+        "element_size": 36,
+        "list": False,
+        "offset": 6097817636,
+        "size": 4,
+        "string": True
+    },
+    {
+        "align": 1,
+        "element": None,
+        "element_size": 1,
+        "list": False,
+        "offset": 6097817637,
+        "size": 1,
+        "string": False
+    },
+    {
+        "align": 4,
+        "element": None,
+        "element_size": 4,
+        "list": False,
+        "offset": 6097817644,
+        "size": 4,
+        "string": False
+    },
+    {
+        "align": 1,
+        "element": None,
+        "element_size": 1,
+        "list": False,
+        "offset": 6097817645,
+        "size": 1,
+        "string": False
+    },
+    {
+        "align": 4,
+        "element": None,
+        "element_size": 4,
+        "list": False,
+        "offset": 6097817652,
+        "size": 4,
+        "string": False
+    }
+]
+
+# these are chains we'll use for testing on games we are encountering issues with
+# so we don't need to parse the entire JSON dump
 default_chains = {
-    "via.motion.tree.AddBlendNode": {
+    "via.render.Mesh": {
         "deserializer_chain": [
             {
-                "address": "0x143bbbfd0",
+                "address": "0x14b34c9c0",
                 "name": "via.Object"
             },
             {
-                "address": "0x143bc9390",
-                "name": "via.motion.tree.BaseNode"
-            },
-            {
-                "address": "0x143bca5a0",
-                "name": "via.motion.tree.TreeNode"
-            },
-            {
-                "address": "0x143bc9880",
-                "name": "via.motion.tree.InnerNodeDynamic"
-            },
-            {
-                "address": "0x143bc9110",
-                "name": "via.motion.tree.BaseBlendNode"
-            },
-            {
-                "address": "0x143bc9230",
-                "name": "via.motion.tree.BaseLayerBlendNode"
-            },
-            {
-                "address": "0x143bc98b0",
-                "name": "via.motion.tree.AddBlendNode"
-            }
-        ],
-    },
-    "via.render.LocalCubemap": {
-        "deserializer_chain": [
-            {
-                "address": "0x143bbbfd0",
-                "name": "via.Object"
-            },
-            {
-                "address": "0x143bd0d80",
+                "address": "0x14aeedf90",
                 "name": "System.Object"
             },
             {
-                "address": "0x143bd1650",
+                "address": "0x140001000",
                 "name": "via.Component"
             },
             {
-                "address": "0x143bd3b70",
-                "name": "via.render.LocalCubemap"
-            }
-        ],
-    },
-    "via.render.MaterialParam": {
-        "address": "1451e8988",
-        "crc": "2bedb2b0",
-        "deserializer_chain": [
-            {
-                "address": "0x143bbbfd0",
-                "name": "via.Object"
-            },
-            {
-                "address": "0x143bd0d80",
-                "name": "System.Object"
-            },
-            {
-                "address": "0x143bd3c50",
-                "name": "via.render.MaterialParam"
-            }
-        ],
-    },
-    "via.wwise.WwiseMaterialSwitchParam": {
-        "deserializer_chain": [
-            {
-                "address": "0x143bbbfd0",
-                "name": "via.Object"
-            },
-            {
-                "address": "0x143bd0d80",
-                "name": "System.Object"
-            },
-            {
-                "address": "0x143bdffe0",
-                "name": "via.wwise.WwiseMaterialSwitchParam"
-            }
-        ],
-    },
-    "via.wwise.WwiseSwitchByNameParam": {
-        "deserializer_chain": [
-            {
-                "address": "0x143bbbfd0",
-                "name": "via.Object"
-            },
-            {
-                "address": "0x143bd0d80",
-                "name": "System.Object"
-            },
-            {
-                "address": "0x143bdffe0",
-                "name": "via.wwise.WwiseSwitchByNameParam"
-            }
-        ],
-    },
-    "via.wwise.WwiseSwitchList": {
-        "deserializer_chain": [
-            {
-                "address": "0x143bbbfd0",
-                "name": "via.Object"
-            },
-            {
-                "address": "0x143bd0d80",
-                "name": "System.Object"
-            },
-            {
-                "address": "0x143bd1650",
-                "name": "via.Component"
-            },
-            {
-                "address": "0x143bbb830",
-                "name": "via.Behavior"
-            },
-            {
-                "address": "0x143bdb270",
-                "name": "via.wwise.Wwise"
-            },
-            {
-                "address": "0x143bdb470",
-                "name": "via.wwise.WwiseSwitchList"
-            }
-        ],
-    },
-    "via.wwise.WwiseSwitchParam": {
-        "deserializer_chain": [
-            {
-                "address": "0x143bbbfd0",
-                "name": "via.Object"
-            },
-            {
-                "address": "0x143bd0d80",
-                "name": "System.Object"
-            },
-            {
-                "address": "0x143be0260",
-                "name": "via.wwise.WwiseSwitchParam"
+                "address": "0x14af4d7a0",
+                "name": "via.render.Mesh"
             }
         ],
     }
@@ -192,7 +116,7 @@ class Allocator:
 
 allocator = None
 
-def invalidate_and_return_call(emu, frame):
+def invalidate_and_return_call(emu, frame, nop_out=True):
     cs = frame["cs"]
 
     # Load the context before the previous call
@@ -214,13 +138,25 @@ def invalidate_and_return_call(emu, frame):
         for i in range(rip, rip + dis.size):
             hist[i] = hist[i] - 1
 
-    emu.mem_write(emu.reg_read(UC_X86_REG_RIP), b"\x90\x90\x90\x90\x90")
+    dis = next(cs.disasm(emu.mem_read(rip, 0x100), rip, 1)) # Disassembling because not all call variants are E8
+    # emu.mem_write(emu.reg_read(UC_X86_REG_RIP), b"\x90\x90\x90\x90\x90")
+    if nop_out == True:
+        nops = b"\x90" * dis.size
+        emu.mem_write(rip, nops)
+
+        # If we dont clear instruction cache, it will (unfortunately randomly) execute the old stuff again
+        emu.ctl_remove_cache(rip, rip + dis.size)
+    
     emu.reg_write(UC_X86_REG_RAX, 0)
     emu.reg_write(UC_X86_REG_RDX, 0)
     emu.reg_write(UC_X86_REG_RCX, 0)
     emu.reg_write(UC_X86_REG_R8, 0)
     emu.reg_write(UC_X86_REG_R9, 0)
-    frame["start"] = emu.reg_read(UC_X86_REG_RIP)
+
+    if nop_out == True:
+        frame["start"] = emu.reg_read(UC_X86_REG_RIP)
+    else:
+        frame["start"] = emu.reg_read(UC_X86_REG_RIP) + dis.size
     
     # Try to read the new address to make sure it's valid memory
     try:
@@ -245,6 +181,8 @@ def hook_mem_invalid(emu, access, address, size, value, frame):
 import traceback
 
 def hook_code(emu, address, size, frame):
+        # print("%x" % address)
+
         frame["context"] = pickle.dumps(emu.context_save())
         cs = frame["cs"]
         deserialize_arg = frame["deserialize_arg"]
@@ -253,7 +191,14 @@ def hook_code(emu, address, size, frame):
         # It's also easier to manage this way, we don't have to worry about nested shit.
         if len(frame["call_stack"]) > 1 and address in frame["deserializers"]:
             print("STOPPING EXECUTION!!!!")
-            invalidate_and_return_call(emu, frame)
+
+            # Advance stream pointer as we've already emulated the parent and know where it ends
+            if address in frame["deserializer_maxs"]:
+                emu.mem_write(frame["deserialize_arg"] + 0x8, frame["deserializer_maxs"][address].to_bytes(8, sys.byteorder))
+                print("[precomputed] Advanced stream pointer due to parent already being deserialized")
+
+            invalidate_and_return_call(emu, frame, nop_out=False)
+            frame["stopped"] = True
             emu.emu_stop()
             return
 
@@ -266,8 +211,10 @@ def hook_code(emu, address, size, frame):
             # Any other function is irrelevant to us
             if emu.reg_read(UC_X86_REG_RCX) != deserialize_arg:
                 invalidate_and_return_call(emu, frame)
+                frame["stopped"] = True
                 emu.emu_stop()
                 return
+                
 
         '''
         try:
@@ -280,13 +227,31 @@ def hook_code(emu, address, size, frame):
         # print("%X %i" % (address, size))
 
         try:
-            dis = next(cs.disasm(emu.mem_read(address, size), address, 1))
+            # Read 15 bytes as that's the max size of an instruction on x86_64
+            # previously this was failing patheticly on a vbroadcastss instruction
+            # which is quite a rare instruction and also quite large
+            dis = next(cs.disasm(emu.mem_read(address, 15), address, 1))
         except Exception as e:
-            print(traceback.format_exc(), "EXCEPTION 0x%X" % address)
+            print(traceback.format_exc(), "EXCEPTION 0x%X size 0x%x" % (address, size))
             print(" ", emu.mem_read(address, 0x100).hex())
             print("%X" % frame["call_stack"][-1]["last_executed_addr"])
             os.system("pause")
         # print("0x%x: %s %s" % (address, dis.mnemonic, dis.op_str))
+
+        #if dis.prefix == "lock":
+        if emu.mem_read(address, 1) == b"\xF0":
+            print("LOCK PREFIX DETECTED! 0x%X %i" % (address, dis.size))
+            # Skip over instruction
+            #emu.reg_write(UC_X86_REG_RIP, address + dis.size)
+            next_dis = next(cs.disasm(emu.mem_read(address + dis.size, 15), address + dis.size, 1))
+            # Check if next insn is a conditional jmp and nop it out
+            if next_dis.mnemonic == "jne":
+                print("JNE detected after lock prefix, NOPing out")
+                nops = b"\x90" * next_dis.size
+                emu.mem_write(address + dis.size, nops)
+                emu.ctl_remove_cache(address + dis.size, address + dis.size + next_dis.size)
+
+            return
 
         lex = 0
 
@@ -298,10 +263,16 @@ def hook_code(emu, address, size, frame):
 
             # We just left a loop
             if address not in cur_hist.keys() and lex in cur_hist.keys() and cur_hist[lex] > 1:
-                list_size = cur_hist[lex] - 1
+                list_size = cur_hist[lex] + 1
+
+                # Corrections for for loops vs do while loops
+                if list_size == FILL_BYTE + 1:
+                    list_size = FILL_BYTE
+                
+                # print("Multiple execution @ 0x%X (%i)" % (lex, list_size))
 
                 # Loop count matches the integer we filled the whole buffer with
-                if list_size == FILL_BYTE:
+                if list_size == FILL_BYTE and len(frame["layout"]) > FILL_BYTE and int.from_bytes(emu.mem_read(frame["deserialize_arg"] + 0x8, 8), sys.byteorder) > frame["max_deserialize_cur"]:
                     try:
                         element_layout = frame["layout"][-1]
                     except IndexError as e:
@@ -320,7 +291,20 @@ def hook_code(emu, address, size, frame):
                     frame["layout"] = frame["layout"][0:len(frame["layout"]) - FILL_BYTE]
                     frame["was_string"] = False
 
-                    list_layout = frame["layout"][-1]
+                    try:
+                        list_layout = frame["layout"][-1]
+                    except IndexError as e:
+                        cs.detail = True
+                        dis_g = cs.disasm(emu.mem_read(lex, 0x100), address, 1)
+                        dis = next(dis_g)
+
+                        print("LEX: 0x%x" % lex)
+                        print("0x%x: %s %s" % (address, dis.mnemonic, dis.op_str))
+
+                        print("Instruction at %X didn't read bytes from stream? (2)" % address)
+                        os.system("pause")
+                        return
+                    
                     list_layout["list"] = True
                     list_layout["element"] = element_layout
                     list_layout["element_size"] = int((element_layout["offset"] - list_layout["offset"]) / FILL_BYTE)
@@ -389,7 +373,9 @@ def hook_code(emu, address, size, frame):
                 frame["was_string"] = True
             elif frame["last_alignment"] == 4 and last_dis.bytes == bytearray(b"\x4B\x8D\x0C\x41"): # this means "lea rcx, [r9+r8*2]", e.g. reading a wide string
                 frame["was_string"] = True
-
+                #print("String or list detected")
+            elif frame["last_alignment"] == 4 and last_dis.bytes == bytearray(b"\x4A\x8D\x14\x4A"): # this means "lea rdx, [rdx+r9*2]", e.g. reading a wide string
+                frame["was_string"] = True
                 #print("String or list detected")
 
             cs.detail = False
@@ -439,22 +425,46 @@ def hook_code(emu, address, size, frame):
 
                 deserialize_cur = int.from_bytes(emu.mem_read(deserialize_arg + 0x8, 8), sys.byteorder)
 
-                if deserialize_cur != frame["last_deserialize_cur"]:
+                if deserialize_cur > frame["last_deserialize_cur"]:
                     delta = deserialize_cur - frame["last_deserialize_cur"]
 
                     # print("0x%X bytes, 0x%X alignment" % (delta, frame["last_alignment"]))
 
-                    frame["layout"].append({ 
-                        "size": delta,
-                        "element_size": delta,
-                        "element": None,
-                        "align": frame["last_alignment"],
-                        "string": frame["was_string"],
-                        "list": False,
-                        "offset": deserialize_cur
-                    })
+                    if deserialize_cur > frame["max_deserialize_cur"]: # This stop duplicates from inlined descendants from leaking into this.
+                        if len(frame["layout"]) > 0:
+                            prev_layout = frame["layout"][-1]
 
-                    frame["last_layout_size"] = len(frame["layout"])
+                            if prev_layout != None:
+                                # Check if the stream pointer moved by a strange amount
+                                expected_offset = 0
+
+                                # so this is probably confusing but anyways "offset" is actually AFTER the data
+                                if prev_layout["string"] == False and prev_layout["list"] == False:
+                                    expected_offset = ((prev_layout["offset"] + delta) + (frame["last_alignment"] - 1)) & ~(frame["last_alignment"] - 1)
+                                elif prev_layout["string"] == True:
+                                    expected_offset = ((prev_layout["offset"] + delta) + (frame["last_alignment"] - 1)) & ~(frame["last_alignment"] - 1)
+                                elif prev_layout["list"] == True:
+                                    expected_offset = ((prev_layout["element"]["offset"] + delta) + (frame["last_alignment"] - 1)) & ~(frame["last_alignment"] - 1)
+                                
+                                actual_offset = deserialize_cur - frame["buffer_start"]
+                                if expected_offset != actual_offset:
+                                    print("Stream pointer shifted by an unaccounted amount! 0x%X -> 0x%X (%i)" % (expected_offset, actual_offset, len(frame["layout"])))
+                                    print("Last layout: ", prev_layout)
+                                    #os.system("pause")
+                            #elif delta != 0:
+                                #print("Stream pointer shifted by an unaccounted amount! 0x%X -> 0x%X (%i)" % (0, delta, len(frame["layout"])))
+
+                        frame["layout"].append({ 
+                            "size": delta,
+                            "element_size": delta,
+                            "element": None,
+                            "align": frame["last_alignment"],
+                            "string": frame["was_string"],
+                            "list": False,
+                            "offset": deserialize_cur - frame["buffer_start"]
+                        })
+
+                        frame["last_layout_size"] = len(frame["layout"])
                     frame["was_string"] = False
 
                 frame["last_deserialize_reg"] = -1
@@ -465,22 +475,118 @@ def hook_code(emu, address, size, frame):
                 if len(frame["call_stack"]) == 0:
                     # print("Reached end of function call")
                     frame["start"] = EMU_END
+                    frame["stopped"] = True
                     emu.emu_stop()
             else:
                 print("Reached end of function call in a BAD WAY")
                 frame["start"] = EMU_END
+                frame["stopped"] = True
                 emu.emu_stop()
+        else:
+            # Allows us to detect stream modifications that are inline
+            if len(frame["call_stack"]) == 1: # HACK: this is a fix for string read functions that are not inlined. Not future proof!
+                deserialize_cur = int.from_bytes(emu.mem_read(deserialize_arg + 0x8, 8), sys.byteorder)
+                
+                if cur_hist[address] > FILL_BYTE:
+                    #print("WARNING: Multiple execution of instruction at 0x%X (%i)" % (address, cur_hist[address]))
+
+                    if cur_hist[address] > 200:
+                        print("WARNING: Too many executions of instruction at 0x%X, STOPPING EXECUTION!" % address)
+                        frame["start"] = EMU_END
+                        frame["stopped"] = True
+                        emu.emu_stop()
+                        return
+
+                if deserialize_cur > frame["last_deserialize_cur"]: # != is naive, it must be greater to get past alignment
+                    # check if we've already executed this instruction
+                    cur_hist = frame["call_stack"][-1]["history"]
+
+                    delta = deserialize_cur - frame["last_deserialize_cur"]
+
+                    if deserialize_cur > frame["max_deserialize_cur"]: # This stop duplicates from inlined descendants from leaking into this.
+                        prev_layout = frame["layout"][-1] if len(frame["layout"]) > 0 else None
+
+                        # this is a fallback if we are in the very first detected field of the struct
+                        # but there was a parent struct that was deserialized before this one
+                        if prev_layout is None:
+                            prev_layout = frame["prev_layout"][-1] if len(frame["prev_layout"]) > 0 else None
+
+                        # Check if the stream pointer moved by a strange amount
+                        if prev_layout != None:
+                            expected_offset = 0
+
+                            # so this is probably confusing but anyways "offset" is actually AFTER the data
+                            if prev_layout["string"] == False and prev_layout["list"] == False:
+                                expected_offset = ((prev_layout["offset"] + delta) + (frame["last_alignment"] - 1)) & ~(frame["last_alignment"] - 1)
+                            elif prev_layout["string"] == True:
+                                expected_offset = ((prev_layout["offset"] + delta) + (frame["last_alignment"] - 1)) & ~(frame["last_alignment"] - 1)
+                            elif prev_layout["list"] == True:
+                                expected_offset = ((prev_layout["element"]["offset"] + delta) + (frame["last_alignment"] - 1)) & ~(frame["last_alignment"] - 1)
+                            
+                            actual_offset = deserialize_cur - frame["buffer_start"]
+                            if expected_offset < actual_offset:
+                                print("Stream pointer shifted by an unaccounted amount! 0x%X -> 0x%X (%i)" % (expected_offset, actual_offset, len(frame["layout"])))
+                                print("Last layout: ", prev_layout)
+
+                                # Add padding to the layout
+                                padding_needed = actual_offset - expected_offset
+                                frame["layout"].append({ 
+                                    "size": padding_needed,
+                                    "element_size": padding_needed,
+                                    "element": None,
+                                    "align": 1,
+                                    "string": False,
+                                    "list": False,
+                                    "offset": deserialize_cur - padding_needed - frame["buffer_start"]
+                                })
+
+                        frame["layout"].append({ 
+                            "size": delta,
+                            "element_size": delta,
+                            "element": None,
+                            "align": frame["last_alignment"],
+                            "string": frame["was_string"],
+                            "list": False,
+                            "offset": deserialize_cur - frame["buffer_start"]
+                        })
+
+                        frame["last_layout_size"] = len(frame["layout"])
+                    frame["was_string"] = False
+                    
+                    frame["last_deserialize_reg"] = -1
+                    frame["last_deserialize_reg_val"] = 0
+                    frame["last_alignment"] = 1
+                
+                    frame["last_deserialize_cur"] = deserialize_cur
 
         if len(frame["call_stack"]) > 0:
             frame["call_stack"][-1]["last_executed_addr"] = address
 
         frame["last_disasm"] = dis
 
+# Hook for valid memory reads.
+def hook_read(emu, access, address, size, value, frame):
+    buffer_start = frame["buffer_start"]
+    buffer_end = frame["buffer_end"]
+
+    if address >= buffer_start and address < buffer_end:
+        if size <= 32:
+            #replacement_value = int(FILL_BYTE).to_bytes(size, sys.byteorder)  # 8 bytes representing the integer 16
+            emu.mem_write(address, np.zeros(size, dtype=np.byte).tobytes())
+            emu.mem_write(address, int(FILL_BYTE).to_bytes(1, sys.byteorder))
+
+            #print("%i bytes read at 0x%X" % (size, emu.reg_read(UC_X86_REG_RIP)))
+
 # Nops out instructions that are causing problems so we can continue execution
 def hook_unmapped(emu, access, address, size, value, frame):
+    # Check if emulator is already stopped
+    if frame["stopped"]:
+        return False
+    
     # Execution has left the scope of the function.
     if len(frame["call_stack"]) == 0:
         frame["start"] = EMU_END
+        frame["stopped"] = True
         emu.emu_stop()
         return False
 
@@ -501,8 +607,14 @@ def hook_unmapped(emu, access, address, size, value, frame):
         # only NOP out non-return instructions
         # otherwise weird things happen
         if dis.mnemonic != "ret":
-            nops = np.empty(dis.size, dtype=np.byte)
-            nops.fill(0x90)
+            # Fuck you numpy
+            nops = np.empty(dis.size, dtype=np.ubyte)
+
+            try:
+                nops.fill(0x90)
+            except Exception as e:
+                print("Failed to create NOPs for size %i at 0x%X" % (dis.size, rip))
+                return
 
             # Fix the history count for RIP
             if len(frame["call_stack"]) > 0 and rip in frame["call_stack"][-1]["history"]:
@@ -513,6 +625,8 @@ def hook_unmapped(emu, access, address, size, value, frame):
 
             # Nop out the instruction causing read/write errors
             emu.mem_write(rip, nops.tobytes())
+            emu.ctl_remove_cache(rip, rip + dis.size)
+            #emu.reg_write(UC_X86_REG_RIP, rip + dis.size)
         else:
             print("WTF? WE TRIED TO NOP OUT A RET? 0x%X" % rip)
 
@@ -534,6 +648,27 @@ def hook_write(emu, access, address, size, value, frame):
 
     return True
 
+def hook_invalid_insn(emu, frame):
+    rip = emu.reg_read(UC_X86_REG_RIP)
+
+    try:
+        print("Invalid instruction at 0x%X, attempting to ignore..." % rip)
+        cs = frame["cs"]
+
+        dis = next(cs.disasm(emu.mem_read(rip, 0x100), rip, 1))
+        print("0x%x: %s %s" % (rip, dis.mnemonic, dis.op_str))
+
+        # Advance to the next instruction
+        frame["start"] = emu.reg_read(UC_X86_REG_RIP)
+        emu.reg_write(UC_X86_REG_RIP, rip + dis.size)
+        nops = b"\x90" * dis.size
+        emu.mem_write(rip, nops)
+        emu.ctl_remove_cache(rip, rip + dis.size)
+    except Exception as e:
+        print("Failed to disassemble 0x%X" % rip)
+        return
+
+
 def verify_file(p):
     if not os.path.exists(p):
         print("Path %s does not exist" % p)
@@ -548,6 +683,8 @@ def verify_file(p):
 def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
     if not verify_file(p) or not verify_file(il2cpp_path):
         return
+
+    # test_mode = True
 
     pe_filename = os.path.basename(p)
 
@@ -659,6 +796,10 @@ def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
         "cs": cs,
         "deserialize_arg": deserialize_arg,
         "last_deserialize_cur": int.from_bytes(emu.mem_read(deserialize_arg + 0x8, 8), sys.byteorder),
+        "max_deserialize_cur": 0,
+        "current_deserializer": 0,
+        "deserializer_layouts": {},
+        "deserializer_maxs": {},
         "allocator": allocator,
         "last_deserialize_reg": -1,
         "last_deserialize_reg_val": 0,
@@ -666,25 +807,44 @@ def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
         "last_alignment": 1,
         "call_stack": [],
         "layout": [],
+        "prev_layout": [],
         "was_string": False,
         "last_return_val": 0,
         "last_layout_size": 0,
         "fake_vtable": fake_vtable,
         "fake_return_func": fake_return_func,
+        "buffer_start": deserialize_buffer,
+        "buffer_end": deserialize_buffer + REGISTER_MEMORY_SIZE,
+        "stopped": False
     }
 
     emu.hook_add(UC_HOOK_CODE, hook_code, meta_frame)
     # emu.hook_add(UC_HOOK_MEM_INVALID, hook_mem_invalid, meta_frame)
+    emu.hook_add(UC_HOOK_INSN_INVALID, hook_invalid_insn, meta_frame)
     emu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hook_unmapped, meta_frame)
     emu.hook_add(UC_HOOK_MEM_READ_UNMAPPED, hook_unmapped, meta_frame)
     emu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hook_unmapped, meta_frame)
     emu.hook_add(UC_HOOK_MEM_WRITE, hook_write, meta_frame)
+    emu.hook_add(UC_HOOK_MEM_READ, hook_read, meta_frame)
 
     pristine_context = pickle.dumps(emu.context_save())
 
-    def detect_members(deserializer_start):
+    def detect_members(deserializer_start, prev_entries):
         if deserializer_start in zero_member_functions:
             return []
+        
+        if deserializer_start in prev_entries:
+            print("Detected duplicate deserializer call at 0x%X" % deserializer_start)
+            return []
+        
+        if deserializer_start in meta_frame["deserializer_layouts"]:
+            if deserializer_start in meta_frame["deserializer_maxs"]:
+                meta_frame["max_deserialize_cur"] = meta_frame["deserializer_maxs"][deserializer_start]
+
+            if deserializer_start in meta_frame["deserializer_layouts"]:
+                meta_frame["prev_layout"] = meta_frame["deserializer_layouts"][deserializer_start]
+            
+            return meta_frame["deserializer_layouts"][deserializer_start]
 
         # print("Detecting members for deserializer %X" % deserializer_start)
 
@@ -731,16 +891,20 @@ def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
             "first": False
         })
 
+        meta_frame["current_deserializer"] = deserializer_start
         meta_frame["start"] = deserializer_start
         meta_frame["last_deserialize_reg"] = -1
         meta_frame["last_deserialize_reg_val"] = 0
         meta_frame["last_alignment"] = 1
         meta_frame["was_string"] = False
         meta_frame["last_deserialize_cur"] = int.from_bytes(emu.mem_read(deserialize_arg + 0x8, 8), sys.byteorder)
+        start_deserialize_cur = meta_frame["last_deserialize_cur"]
 
         prev_layout_size = len(meta_frame["layout"])
 
         out_layout = []
+
+        original_start = deserializer_start
 
         for i in range(0, 1000):
             # Execution has left the scope of the function.
@@ -750,12 +914,15 @@ def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
             if meta_frame["start"] == EMU_END:
                 break
 
+            meta_frame["stopped"] = False
+
             try:
                 emu.emu_start(meta_frame["start"], deserializer_start + 0x10000)
             except unicorn.UcError as e:
+                print("RIP: 0x%X" % emu.reg_read(UC_X86_REG_RIP))
+                print(e)
+                #meta_frame["start"] = emu.reg_read(UC_X86_REG_RIP)
                 continue
-                #print("RIP: 0x%X" % emu.reg_read(UC_X86_REG_RIP))
-                #print(e)
 
         layout_delta = len(meta_frame["layout"]) - prev_layout_size
         # print("Function contained %i members" % layout_delta)
@@ -763,25 +930,48 @@ def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
             zero_member_functions[deserializer_start] = True
         else:
             out_layout = meta_frame["layout"][prev_layout_size:(prev_layout_size+layout_delta)]
+
+        cur_deserialize_cur = int.from_bytes(emu.mem_read(deserialize_arg + 0x8, 8), sys.byteorder)
+
+        if cur_deserialize_cur > start_deserialize_cur and cur_deserialize_cur > meta_frame["max_deserialize_cur"]:
+            meta_frame["max_deserialize_cur"] = cur_deserialize_cur
+        
+        if cur_deserialize_cur > start_deserialize_cur:
+            meta_frame["deserializer_maxs"][deserializer_start] = cur_deserialize_cur
+        
+        meta_frame["deserializer_layouts"][deserializer_start] = out_layout
         
         return out_layout
 
     # Detects members for one structure deserializer chain
     def detect_members_chain(struct_name, chain):
         meta_frame["layout"] = []
+        meta_frame["prev_layout"] = []
+        meta_frame["max_deserialize_cur"] = 0
         # our dict to check if the deserializer calls a parent deserializer (and ignore it)
         meta_frame["deserializers"] = {int(address, 16): True for item in chain for (key, address) in item.items() if key == "address"}
 
         emu.context_restore(pickle.loads(pristine_context))
-
+ 
         layout_list = []
+        prev_entries = {}
 
         # Actually detect the members now
         for entry in chain:
+            addr = int(entry["address"], 16)
+            #print("Detecting members for %s at 0x%X" % (entry["name"], addr))
             layout_list.append({
                 "name": entry["name"],
-                "layout": detect_members(int(entry["address"], 16))
+                "layout": detect_members(addr, prev_entries)
             })
+
+            # This is because for some reason in Wilds this deserializer is obfuscated to hell and the emulator can't handle it
+            if entry["name"] == "via.motion.JointExprGraphLayer" and len(layout_list[-1]["layout"]) == 0:
+                layout_list[-1]["layout"] = hardcoded_jointexprgraphlayer
+                print("Hardcoded layout for via.motion.JointExprGraphLayer")
+
+            prev_entries[addr] = True
+            meta_frame["prev_layout"] = layout_list[-1]["layout"]
 
         def generate_typename(layout):
             typename = ""
@@ -852,7 +1042,7 @@ def main(p, il2cpp_path="il2cpp_dump.json", test_mode=False):
                             break
 
                         print(ins)
-                    os.system("pause")
+                    # os.system("pause")
 
         count = count + 1
         sys.stdout.write("\r%f%%" % (float(count / chains_len) * 100.0))

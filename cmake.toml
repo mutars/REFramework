@@ -5,6 +5,7 @@
 [project]
 name = "reframework"
 cmake-after = """
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MP")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
 
@@ -14,6 +15,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
 set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
 set(DYNAMIC_LOADER ON CACHE BOOL "" FORCE) # OpenXR
 set(BUILD_TOOLS OFF CACHE BOOL "" FORCE) # DirectXTK
+set(SAFETYHOOK_FETCH_ZYDIS ON)
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE) # Freetype
 
 if ("${CMAKE_BUILD_TYPE}" MATCHES "Release")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /MT")
@@ -32,7 +35,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 """
 
 [options]
-DEVELOPER_MODE = { value = true, comment = "Enable developer mode" }
+DEVELOPER_MODE = { value = true }
 REF_BUILD_RE2_SDK = false
 REF_BUILD_RE2_TDB66SDK = false
 REF_BUILD_RE3_SDK = false
@@ -45,11 +48,13 @@ REF_BUILD_DMC5_SDK = false
 REF_BUILD_MHRISE_SDK = false
 REF_BUILD_SF6_SDK = false
 REF_BUILD_DD2_SDK = false
-REF_BUILD_FRAMEWORK = { value = true, comment = "Enable building the full REFramework" }
-REF_BUILD_DEPENDENCIES = { value = true, comment = "Enable building dependencies" }
+REF_BUILD_MHWILDS_SDK = false
+REF_BUILD_PRAGMATA_SDK = false
+REF_BUILD_FRAMEWORK = { value = true }
+REF_BUILD_DEPENDENCIES = { value = true }
 
 [conditions]
-developer-mode = "DEVELOPER_MODE"
+developer-mode-cond = "DEVELOPER_MODE"
 build-framework = "REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8"
 build-re2-sdk = "REF_BUILD_RE2_SDK OR REF_BUILD_FRAMEWORK"
 build-re2tdb66-sdk = "REF_BUILD_RE2_TDB66SDK OR REF_BUILD_FRAMEWORK"
@@ -63,6 +68,8 @@ build-dmc5-sdk = "REF_BUILD_DMC5_SDK OR REF_BUILD_FRAMEWORK"
 build-mhrise-sdk = "REF_BUILD_MHRISE_SDK OR REF_BUILD_FRAMEWORK"
 build-sf6-sdk = "REF_BUILD_SF6_SDK OR REF_BUILD_FRAMEWORK"
 build-dd2-sdk = "REF_BUILD_DD2_SDK OR REF_BUILD_FRAMEWORK"
+build-mhwilds-sdk = "REF_BUILD_MHWILDS_SDK OR REF_BUILD_FRAMEWORK"
+build-pragmata-sdk = "REF_BUILD_PRAGMATA_SDK OR REF_BUILD_FRAMEWORK"
 build-framework-dependencies = "REF_BUILD_DEPENDENCIES AND CMAKE_SIZEOF_VOID_P EQUAL 8"
 
 [fetch-content.asmjit]
@@ -79,7 +86,7 @@ tag = "f5026eb34e7053b1aff325d38db107703f394974"
 
 [fetch-content.directxtk12]
 git = "https://github.com/microsoft/DirectXTK12"
-tag = "528801aa6dd8d628c2f756c41a76d300f47de478"
+tag = "be5dfc7e391aefaa4eeab8e8a08f7e2669e56cbb"
 
 [target.spdlog]
 cmake-after="""
@@ -111,13 +118,29 @@ include-directories = [
 ]
 condition = "build-framework-dependencies"
 
+[fetch-content.safetyhook]
+git = "https://github.com/cursey/safetyhook"
+tag = "b046e123dc69821f2c375161e0adef3c6d9c9db4"
+
+[fetch-content.freetype]
+git = "https://github.com/freetype/freetype"
+tag = "f1cd6dbfa0c98f352b698448f40ac27e8fb3832e"
 
 [target.imgui]
 type = "static"
-sources = ["dependencies/imgui/*.cpp"]
-include-directories = ["dependencies/imgui", "src/re2-imgui"]
+sources = [
+    "dependencies/imgui/*.cpp",
+    "dependencies/imgui/misc/freetype/imgui_freetype.cpp",
+]
+include-directories = [
+    "dependencies/imgui",
+    "dependencies/imgui/misc/freetype",
+    "src/re2-imgui"]
 compile-definitions = [
     "IMGUI_USER_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/src/re2-imgui/re2_imconfig.hpp\"",
+]
+link-libraries = [
+    "freetype"
 ]
 condition = "build-framework"
 
@@ -171,7 +194,7 @@ tag = "v1.34.10"
 
 [fetch-content.kananlib]
 git = "https://github.com/cursey/kananlib"
-tag = "main"
+tag = "3a2448d5b12afd607f02af231571ec76443cb545"
 
 [target.utility]
 type = "static"
@@ -182,6 +205,7 @@ compile-features = ["cxx_std_23"]
 link-libraries = [
     "spdlog",
     "minhook",
+    "safetyhook",
     "kananlib"
 ]
 
@@ -210,7 +234,7 @@ link-directories = ["dependencies/openvr/lib/win64/"]
 compile-options = ["/GS-", "/bigobj", "/EHa"]
 compile-features = ["cxx_std_23"]
 compile-definitions = ["${CMKR_TARGET}", "REFRAMEWORK_EXPORTS", "REFRAMEWORK_GAME_NAME=\"${CMKR_TARGET}\""]
-developer-mode.compile-definitions = ["DEVELOPER"]
+developer-mode-cond.compile-definitions = ["DEVELOPER"]
 link-libraries = [
     "${CMKR_TARGET}SDK",
     "utility",
@@ -232,6 +256,15 @@ link-libraries = [
     "DirectXTK",
     "DirectXTK12"
 ]
+cmake-before="""
+"""
+cmake-after="""
+add_custom_command(
+    TARGET ${CMKR_TARGET} PRE_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Generating commit hash..."
+    COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/MakeCommitHash.bat
+)
+"""
 
 [template.game.properties]
 OUTPUT_NAME = "dinput8"
@@ -339,10 +372,26 @@ condition = "build-dd2-sdk"
 [target.DD2]
 type = "game"
 
+[target.MHWILDSSDK]
+type = "sdk"
+compile-definitions = ["MHWILDS", "REENGINE_PACKED", "REENGINE_AT"]
+condition = "build-mhwilds-sdk"
+
+[target.MHWILDS]
+type = "game"
+
+[target.PRAGMATASDK]
+type = "sdk"
+compile-definitions = ["PRAGMATA", "REENGINE_PACKED", "REENGINE_AT"]
+condition = "build-pragmata-sdk"
+
+[target.PRAGMATA]
+type = "game"
+
 [template.plugin]
 type = "shared"
 include-directories = ["include/"]
-compile-features = ["cxx_std_20"]
+compile-features = ["cxx_std_23"]
 condition = "build-framework"
 
 [template.plugin.properties]

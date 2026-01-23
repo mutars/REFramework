@@ -4,6 +4,11 @@
 #include <execution>
 #include <sstream>
 
+#include <spdlog/spdlog.h>
+
+
+#include <reframework/API.hpp>
+
 #include "RETypeDB.hpp"
 #include "RETypeDefinition.hpp"
 
@@ -347,9 +352,6 @@ sdk::RETypeDefinition* RETypeDefinition::get_underlying_type() const {
     }
 
 #if TDB_VER > 49
-    // get the underlying type of the enum
-    // and then hash the name of the type instead
-    static auto get_underlying_type_method = this->get_method("GetUnderlyingType");
     const auto runtime_type = this->get_runtime_type();
 
     // dont forget to do this, passing nullptr into GetUnderlyingType causes System.ArgumentNullException
@@ -359,11 +361,24 @@ sdk::RETypeDefinition* RETypeDefinition::get_underlying_type() const {
         return nullptr;
     }
 
+    // get the underlying type of the enum
+    // and then hash the name of the type instead
+    static const auto system_runtime_type_type = sdk::find_type_definition("System.RuntimeType");
+    static const auto old_get_underlying_type_method = system_runtime_type_type != nullptr ? system_runtime_type_type->get_method("GetUnderlyingType") : nullptr;
+    static const auto new_underlying_type_method = system_runtime_type_type != nullptr ? system_runtime_type_type->get_method("GetEnumUnderlyingType") : nullptr;
+    const auto get_underlying_type_method = old_get_underlying_type_method != nullptr ? old_get_underlying_type_method : new_underlying_type_method;
+
+    if (get_underlying_type_method == nullptr) {
+        std::unique_lock _{ g_underlying_mtx };
+        g_underlying_types[this] = nullptr;
+        SPDLOG_WARN("[RETypeDefinition] Failed to find GetUnderlyingType method for {}", this->get_full_name());
+        return nullptr;
+    }
+
     const auto underlying_type = get_underlying_type_method->call<::REManagedObject*>(sdk::get_thread_context(), runtime_type);
 
     if (underlying_type != nullptr) {
-        static auto system_runtime_type_type = sdk::find_type_definition("System.RuntimeType");
-        static auto get_name_method = system_runtime_type_type->get_method("get_FullName");
+        static const auto get_name_method = system_runtime_type_type->get_method("get_FullName");
 
         const auto full_name = get_name_method->call<::REManagedObject*>(sdk::get_thread_context(), underlying_type);
 
@@ -380,6 +395,7 @@ sdk::RETypeDefinition* RETypeDefinition::get_underlying_type() const {
         }
     }
     
+    std::unique_lock _{ g_underlying_mtx };
     return g_underlying_types[this];
 #else
     const auto value_field = this->get_field("value__");
@@ -391,6 +407,7 @@ sdk::RETypeDefinition* RETypeDefinition::get_underlying_type() const {
 
     const auto underlying_type = value_field->get_type();
     
+    std::unique_lock _{ g_underlying_mtx };
     g_underlying_types[this] = underlying_type;
     return g_underlying_types[this];
 #endif
@@ -414,63 +431,94 @@ sdk::RETypeDefinition* RETypeDefinition::get_generic_type_definition() const {
 }
 
 static std::shared_mutex g_field_mtx{};
-static std::unordered_map<std::string, sdk::REField*> g_field_map{};
+static std::unordered_map<const sdk::RETypeDefinition*, std::unordered_map<size_t, sdk::REField*>> g_field_map{};
 
 sdk::REField* RETypeDefinition::get_field(std::string_view name) const {
-    auto full_name = std::to_string(this->get_index()) + "." + name.data();
-
+    const auto name_hash = std::hash<std::string_view>{}(name);
     {
         std::shared_lock _{ g_field_mtx };
 
-        if (auto it = g_field_map.find(full_name); it != g_field_map.end()) {
-            return it->second;
+        if (auto it = g_field_map.find(this); it != g_field_map.end()) {
+            if (auto it2 = it->second.find(name_hash); it2 != it->second.end()) {
+                return it2->second;
+            }
         }
     }
+
 
     for (auto super = this; super != nullptr; super = super->get_parent_type()) {
         for (auto f : super->get_fields()) {
             if (name == f->get_name()) {
                 std::unique_lock _{ g_field_mtx };
 
-                g_field_map[full_name] = f;
-                return g_field_map[full_name];
+                g_field_map[this][name_hash] = f;
+                return g_field_map[this][name_hash];
             }
         }
     }
 
-    return g_field_map[full_name];
+    std::unique_lock _{ g_field_mtx };
+    g_field_map[this][name_hash] = nullptr;
+    return nullptr;
 }
 
 static std::shared_mutex g_method_mtx{};
-static std::unordered_map<std::string, REMethodDefinition*> g_method_map{};
+static std::unordered_map<const sdk::RETypeDefinition*, std::unordered_map<size_t, sdk::REMethodDefinition*>> g_method_map{};
 
 sdk::REMethodDefinition* RETypeDefinition::get_method(std::string_view name) const {
-    // originally this used this->get_full_name() + "." + name.data()
-    // but that doesn't work for generic types if we haven't yet mapped out
-    // how generic (instantiated) types work for the game we're working with
-    // and this is probably faster anyways
-    auto full_name = std::to_string(this->get_index()) + "." + name.data();
+    const auto name_hash = std::hash<std::string_view>{}(name);
 
     {
         std::shared_lock _{g_method_mtx};
 
-        if (auto it = g_method_map.find(full_name); it != g_method_map.end()) {
-            return it->second;
-        }
-    }
-    
-    // first pass, do not use function prototypes
-    for (auto super = this; super != nullptr; super = super->get_parent_type()) {
-        for (auto& m : super->get_methods()) {
-            if (name == m.get_name()) {
-                std::unique_lock _{g_method_mtx};
-
-                g_method_map[full_name] = &m;
-                return g_method_map[full_name];
+        if (auto it = g_method_map.find(this); it != g_method_map.end()) {
+            if (auto it2 = it->second.find(name_hash); it2 != it->second.end()) {
+                return it2->second;
             }
         }
     }
-    
+
+    // This is probably a hacky way of doing it but whatever.
+    // I haven't checked if IsGenericMethodDefinition is implemented.
+    auto is_generic_method_definition = [](sdk::REMethodDefinition& m) {
+        const auto return_type = m.get_return_type();
+
+        if (return_type != nullptr && return_type->get_name() != nullptr) {
+            if (std::string_view{return_type->get_name()}.contains("!")) {
+                return true;
+            }
+        }
+
+        const auto method_param_types = m.get_param_types();
+
+        // Go through any of the params and look for ! in the name
+        for (auto& param : method_param_types) {
+            if (param != nullptr && param->get_name() != nullptr) {
+                if (std::string_view{param->get_name()}.contains("!")) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    };
+
+    for (auto super = this; super != nullptr; super = super->get_parent_type()) {
+        for (auto& m : super->get_methods()) {
+            if (name == m.get_name()) {
+                if (is_generic_method_definition(m)) {
+                    // This is a generic method (definition), we need to skip it because it's not a direct match
+                    continue;
+                }
+
+                std::unique_lock _{g_method_mtx};
+
+                g_method_map[this][name_hash] = &m;
+                return g_method_map[this][name_hash];
+            }
+        }
+    }
+
     // second pass, build a function prototype
     for (auto super = this; super != nullptr; super = super->get_parent_type()) {
         for (auto& m : super->get_methods()) {
@@ -491,15 +539,21 @@ sdk::REMethodDefinition* RETypeDefinition::get_method(std::string_view name) con
             const auto method_prototype = ss.str();
 
             if (name == method_prototype) {
+                if (is_generic_method_definition(m)) {
+                    // This is a generic method (definition), we need to skip it because it's not a direct match
+                    continue;
+                }
+
                 std::unique_lock _{g_method_mtx};
 
-                g_method_map[full_name] = &m;
-                return g_method_map[full_name];
+                g_method_map[this][name_hash] = &m;
+                return g_method_map[this][name_hash];
             }
         }
     }
 
-    return g_method_map[full_name];
+    std::unique_lock _{g_method_mtx};
+    return g_method_map[this][name_hash] = nullptr;
 }
 
 std::vector<sdk::REMethodDefinition*> RETypeDefinition::get_methods(std::string_view name) const {
@@ -563,11 +617,21 @@ uint32_t RETypeDefinition::get_index() const {
 
 int32_t RETypeDefinition::get_fieldptr_offset() const {
 #if TDB_VER > 49
-    if (this->managed_vt == nullptr) {
-        return 0;
-    }
+    #ifdef MHWILDS
+        REObjectInfo *target_managed_vt = get_managed_vt();
 
-    return *(int32_t*)((uintptr_t)this->managed_vt - sizeof(void*));
+        if (target_managed_vt == nullptr) {
+            return 0;
+        }
+
+        return *(int32_t*)((uintptr_t)target_managed_vt - sizeof(void*));
+    #else
+        if (this->managed_vt == nullptr) {
+            return 0;
+        }
+
+        return *(int32_t*)((uintptr_t)this->managed_vt - sizeof(void*));
+    #endif
 #else
     auto vm = sdk::VM::get();
     const auto& vm_type = vm->types[this->get_index()];
@@ -578,13 +642,17 @@ int32_t RETypeDefinition::get_fieldptr_offset() const {
 
 bool RETypeDefinition::has_fieldptr_offset() const {
 #if TDB_VER > 49
-    return this->managed_vt != nullptr;
+    #ifdef MHWILDS
+        return get_managed_vt() != nullptr;
+    #else
+        return this->managed_vt != nullptr;
+    #endif
 #else
     return true;
 #endif
 }
 
-bool RETypeDefinition::is_a(sdk::RETypeDefinition* other) const {
+bool RETypeDefinition::is_a(const sdk::RETypeDefinition* other) const {
     if (other == nullptr) {
         return false;
     }
@@ -661,6 +729,13 @@ bool RETypeDefinition::is_by_ref() const {
     }
 
     static auto by_ref_method = runtime_typedef->get_method("get_IsByRef");
+
+    if (by_ref_method == nullptr) {
+        // well...
+        // We might need to fix this later for Wilds?
+        g_by_ref_map[this] = false;
+        return false;
+    }
 
     g_by_ref_map[this] = by_ref_method->call<bool>(sdk::get_thread_context(), runtime_type);
 
@@ -781,6 +856,39 @@ bool RETypeDefinition::is_generic_type() const {
     return get_generic_data() != nullptr;
 }
 
+bool RETypeDefinition::has_attribute(::REManagedObject* attribute_runtime_type, bool inherit) const {
+    if (attribute_runtime_type == nullptr) {
+        return false;
+    }
+
+    const auto runtime_type = this->get_runtime_type();
+
+    if (runtime_type == nullptr) {
+        return false;
+    }
+
+    const auto runtime_type_t = utility::re_managed_object::get_type_definition(runtime_type);
+
+    if (runtime_type_t == nullptr) {
+        return false;
+    }
+
+    const auto get_custom_attributes = runtime_type_t->get_method("GetCustomAttributes(System.Type, System.Boolean)");
+
+    if (get_custom_attributes == nullptr) {
+        return false;
+    }
+
+    const auto res = get_custom_attributes->invoke(runtime_type, (void*)attribute_runtime_type, (void*)(uint64_t)inherit);
+    const auto attributes_array = (sdk::SystemArray*)res.ptr;
+
+    if (attributes_array == nullptr) {
+        return false;
+    }
+
+    return attributes_array->get_size() > 0;
+}
+
 uint32_t RETypeDefinition::get_crc_hash() const {
 #if TDB_VER > 49
     const auto t = get_type();
@@ -859,6 +967,30 @@ static std::shared_mutex g_runtime_type_mtx{};
     static auto get_assemblies_func = appdomain_type->get_method("GetAssemblies");
     static auto get_assembly_type_func = assembly_type->get_method("GetType(System.String)");
 
+    if (get_assembly_type_func == nullptr) {
+        static auto system_object_type = sdk::find_type_definition("System.Object");
+        static auto get_type_method = system_object_type->get_method("GetType");
+
+        // Past TDB 74, we have to do this because
+        // a lot of the assembly stuff seems to be stripped?
+        if (get_type_method != nullptr) {
+            struct TypeDefinitionHolder {
+                const sdk::RETypeDefinition* t{nullptr};
+            } holder;
+
+            struct FakeObject {
+                const TypeDefinitionHolder* holder{nullptr};
+            } fake_obj;
+
+            fake_obj.holder = &holder;
+            holder.t = this;
+
+            return get_type_method->call<::REManagedObject*>(sdk::get_thread_context(), &fake_obj);
+        }
+
+        return nullptr;
+    }
+
     auto context = sdk::get_thread_context();
     auto current_domain = get_current_domain_func->call<REManagedObject*>(context, nullptr);
 
@@ -934,6 +1066,9 @@ static std::shared_mutex g_runtime_type_mtx{};
             }
         }
     }
+
+    std::unique_lock _{g_runtime_type_mtx};
+    return g_runtime_type_map[this];    
 #else
     auto vm = sdk::VM::get();
 
@@ -943,11 +1078,10 @@ static std::shared_mutex g_runtime_type_mtx{};
 
     const auto& vm_type = vm->types[this->get_index()];
 
+    std::unique_lock _{g_runtime_type_mtx};
     g_runtime_type_map[this] = (::REManagedObject*)vm_type.runtime_type;
     return g_runtime_type_map[this];
 #endif
-
-    return g_runtime_type_map[this];
 }
 
 void* RETypeDefinition::get_instance() const {
@@ -999,7 +1133,31 @@ void* RETypeDefinition::create_instance() const {
 
 ::REObjectInfo* RETypeDefinition::get_managed_vt() const {
 #if TDB_VER > 49
-    return (::REObjectInfo*)this->managed_vt;
+    #if MHWILDS
+        REObjectInfo *target_managed_vt = this->managed_vt;
+        const int ABSTRACT_TYPE_FLAG = 128;
+
+        if (this->managed_vt == nullptr) {
+            // Abstract
+            if (this->type_flags & ABSTRACT_TYPE_FLAG) {
+                // Keep getting parent type until getting a hit
+                auto parent_type_def = this->get_parent_type();
+                while (parent_type_def != nullptr) {
+                    target_managed_vt = parent_type_def->managed_vt;
+
+                    if (target_managed_vt != nullptr) {
+                        break;
+                    }
+
+                    parent_type_def = parent_type_def->get_parent_type();
+                }
+            }
+        }
+
+        return target_managed_vt;
+    #else
+        return (::REObjectInfo*)this->managed_vt;
+    #endif
 #else
     return (::REObjectInfo*)&sdk::VM::get()->types[this->get_index()];
 #endif
@@ -1015,5 +1173,25 @@ uint32_t RETypeDefinition::get_flags() const {
 
 bool RETypeDefinition::should_pass_by_pointer() const {
     return !is_value_type() || (get_valuetype_size() > sizeof(void*) || (!is_primitive() && !is_enum()));
+}
+
+std::vector<RETypeDefinition*> RETypeDefinition::get_types_inherting_from_this() const {
+    std::vector<RETypeDefinition*> out{};
+    auto tdb = RETypeDB::get();
+
+    // Maybe optimize by making a dependency graph?
+    for (auto i = 0; i < tdb->numTypes; ++i) {
+        auto type = tdb->get_type(i);
+
+        if (type == nullptr) {
+            continue;
+        }
+
+        if (type->is_a(this)) {
+            out.push_back(type);
+        }
+    }
+
+    return out;
 }
 } // namespace sdk

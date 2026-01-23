@@ -18,7 +18,9 @@ std::string& game_namespace(std::string_view base_name)
     using namespace std::string_view_literals;
 
     static constexpr std::string_view prefix{
-#ifdef MHRISE
+#if TDB_VER >= 74
+    "app."sv
+#elif defined(MHRISE)
     "snow."sv
 #elif defined(RE8) || defined(RE7) || defined(DMC5) || defined(SF6)
     "app."sv
@@ -57,6 +59,69 @@ RETypes::RETypes() {
     bool re7_version = false;
 
     if (!ref) {
+#if TDB_VER >= 73
+        // This is the absolutely foolproof way of finding it
+        // We can probably completely replace it with this for all the games, but not doing that just yet to be safe
+        const auto via_object_ref = utility::scan(mod, "BA 55 FD 09 D2");
+
+        if (!via_object_ref) {
+            spdlog::error("Failed to find via object ref");
+            fill_types_from_tdb();
+            return;
+        }
+
+        // now we do the scorched earth method where we exhaustively disassemble all possible paths
+        // looking for any kind of displacement. we will assume that this is the type list
+        // and then walk it. if we get an exception - continue. look for valid types in the list
+        utility::exhaustive_decode((uint8_t*)*via_object_ref, 1000, [&](utility::ExhaustionContext& ctx) -> utility::ExhaustionResult {
+            if (m_raw_types != nullptr) {
+                return utility::ExhaustionResult::BREAK;
+            }
+
+            const auto disp = utility::resolve_displacement(ctx.addr);
+
+            if (!disp.has_value()) {
+                return utility::ExhaustionResult::CONTINUE;
+            }
+
+            try {
+                TypeList* potential_types = (TypeList*)*disp;
+
+                if (potential_types->data == nullptr || IsBadReadPtr(potential_types->data, sizeof(uintptr_t))) {
+                    return utility::ExhaustionResult::CONTINUE;
+                }
+
+                if (potential_types->numAllocated < 0 || potential_types->numAllocated < 100 || potential_types->numAllocated > 9999999) {
+                    return utility::ExhaustionResult::CONTINUE;
+                }
+
+                for (auto i = 0; i < potential_types->numAllocated; ++i) try {
+                    auto t = (*potential_types->data)[i];
+
+                    if (t == nullptr || IsBadReadPtr(t, sizeof(REType))) {
+                        continue;
+                    }
+
+                    if (t->name != nullptr && (std::string_view{t->name} == "via.clr.ManagedObject" || std::string_view{t->name} == "via.Object")) {
+                        m_raw_types = potential_types;
+                        spdlog::info("Found TypeList: {:x} at ref {:x}", (uintptr_t)m_raw_types, ctx.addr);
+                        break;
+                    }
+                } catch(...) {
+                    continue;
+                }
+            } catch (...) {
+                
+            }
+
+            return utility::ExhaustionResult::CONTINUE;
+        });
+
+        if (m_raw_types != nullptr) {
+            refresh_map();
+            return;
+        }
+#else
         // Scan for RE7 version
         // mov edx, 8F7E7AEh (TypeInfoNone hash)
         pat = "BA AE E7 F7 08";
@@ -107,6 +172,7 @@ RETypes::RETypes() {
 
         types_offset = 3;
         re7_version = true;
+#endif
     }
 
     spdlog::info("Initial ref: {:x}", (uintptr_t)*ref);
@@ -228,6 +294,8 @@ void RETypes::fill_types_from_tdb() {
         m_types.insert(t->get_type());
         m_type_list.push_back(t->get_type());
     }
+
+    spdlog::info("filled {} types from TDB", m_types.size());
 }
 
 void RETypes::refresh_map() {
@@ -258,7 +326,9 @@ void RETypes::refresh_map() {
         m_type_map[name] = t;
 
         if (m_types.count(t) == 0) {
-            spdlog::info("{:s}", name);
+            if (i < 100) {
+                spdlog::info("{:s}", name);
+            }
             m_types.insert(t);
             m_type_list.push_back(t);
         }

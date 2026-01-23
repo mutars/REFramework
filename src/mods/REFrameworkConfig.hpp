@@ -4,10 +4,11 @@
 
 class REFrameworkConfig : public Mod {
 public:
+    static inline constexpr std::string_view REFRAMEWORK_CONFIG_NAME{ "re2_fw_config.txt" };
     static std::shared_ptr<REFrameworkConfig>& get();
 
 public:
-    std::string_view get_name() const {
+    std::string_view get_name() const override {
         return "REFrameworkConfig";
     }
 
@@ -40,6 +41,8 @@ private:
 #endif
     ModKey::Ptr m_show_cursor_key{ ModKey::create(generate_name("ShowCursorKey")) };
     ModInt32::Ptr m_font_size{ModInt32::create(generate_name("FontSize"), 16)};
+    std::vector<std::string> fonts{};
+    ModComboString::Ptr m_font_file{};
 
     ValueList m_options {
         *m_menu_key,

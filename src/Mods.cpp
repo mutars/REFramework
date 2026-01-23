@@ -1,5 +1,6 @@
 #include <spdlog/spdlog.h>
 
+#include "mods/BackBufferRenderer.hpp"
 #include "mods/APIProxy.hpp"
 #include "mods/Camera.hpp"
 #include "mods/Graphics.hpp"
@@ -14,19 +15,22 @@
 #include "mods/Scene.hpp"
 #include "mods/ScriptRunner.hpp"
 #include "mods/VR.hpp"
+#include "mods/LooseFileLoader.hpp"
 #include "mods/vr/games/RE8VR.hpp"
 
 #include "Mods.hpp"
 
 Mods::Mods() {
+    m_mods.emplace_back(BackBufferRenderer::get());
     m_mods.emplace_back(REFrameworkConfig::get());
 
-#if defined(RE3) || defined(RE8) || defined(MHRISE)
+#if defined(REENGINE_AT)
     m_mods.emplace_back(std::make_unique<IntegrityCheckBypass>());
 #endif
 
 #ifndef BAREBONES
     m_mods.emplace_back(Hooks::get());
+    m_mods.emplace_back(LooseFileLoader::get());
 
     m_mods.emplace_back(VR::get());
 
@@ -42,7 +46,7 @@ Mods::Mods() {
 
     // All games!!!!
     m_mods.emplace_back(std::make_unique<Camera>());
-    m_mods.emplace_back(std::make_unique<Graphics>());
+    m_mods.emplace_back(Graphics::get());
 
 #if defined(RE2) || defined(RE3) || defined(RE8)
     m_mods.emplace_back(std::make_unique<ManualFlashlight>());
@@ -80,7 +84,7 @@ std::optional<std::string> Mods::on_initialize() const {
         }
     }
 
-    utility::Config cfg{ (REFramework::get_persistent_dir() / "re2_fw_config.txt").string() };
+    utility::Config cfg{ (REFramework::get_persistent_dir() / REFrameworkConfig::REFRAMEWORK_CONFIG_NAME).string() };
 
     for (auto& mod : m_mods) {
         spdlog::info("{:s}::on_config_load()", mod->get_name().data());
@@ -92,9 +96,9 @@ std::optional<std::string> Mods::on_initialize() const {
 
 
 std::optional<std::string> Mods::on_initialize_d3d_thread() const {
-    std::scoped_lock _{g_framework->get_hook_monitor_mutex()};
+    auto do_not_hook_d3d = g_framework->acquire_do_not_hook_d3d();
 
-    utility::Config cfg{ (REFramework::get_persistent_dir() / "re2_fw_config.txt").string() };
+    utility::Config cfg{ (REFramework::get_persistent_dir() / REFrameworkConfig::REFRAMEWORK_CONFIG_NAME).string() };
 
     // once here to at least setup the values
     for (auto& mod : m_mods) {

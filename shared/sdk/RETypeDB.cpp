@@ -19,41 +19,69 @@ RETypeDB* RETypeDB::get() {
 static std::shared_mutex g_tdb_type_mtx{};
 static std::unordered_map<std::string, sdk::RETypeDefinition*> g_tdb_type_map{};
 
-reframework::InvokeRet invoke_object_func(void* obj, sdk::RETypeDefinition* t, std::string_view name, const std::vector<void*>& args) {
+reframework::InvokeRet invoke_object_func(void* obj, sdk::RETypeDefinition* t, std::string_view name, std::vector<void*>& args) {
     const auto method = t->get_method(name);
 
     if (method == nullptr) {
         return reframework::InvokeRet{};
     }
 
-    return method->invoke(obj, args);
+    return method->invoke(obj, std::span<void*>(args));
 }
 
 reframework::InvokeRet invoke_object_func(::REManagedObject* obj, std::string_view name, const std::vector<void*>& args) {
-   return invoke_object_func((void*)obj, utility::re_managed_object::get_type_definition(obj), name, args);
+    const auto t = utility::re_managed_object::get_type_definition(obj);
+
+    if (t == nullptr) {
+        return reframework::InvokeRet{};
+    }
+
+    const auto method = t->get_method(name);
+
+    if (method == nullptr) {
+        return reframework::InvokeRet{};
+    }
+
+    return method->invoke(obj, std::span<void*>(*const_cast<std::vector<void*>*>(&args)));
+}
+
+
+sdk::REModule* RETypeDB::get_module(uint32_t index) const {
+    if (index >= this->numModules) {
+        return nullptr;
+    }
+
+    return &(this->modules)[index];
 }
 
 sdk::RETypeDefinition* RETypeDB::find_type(std::string_view name) const {
+    static bool map_populated = false;
+
     {
         std::shared_lock _{ g_tdb_type_mtx };
 
         if (auto it = g_tdb_type_map.find(name.data()); it != g_tdb_type_map.end()) {
             return it->second;
         }
-    }
 
-    for (uint32_t i = 0; i < this->numTypes; ++i) {
-        auto t = get_type(i);
-
-        if (t->get_full_name() == name) {
-            std::unique_lock _{ g_tdb_type_mtx };
-
-            g_tdb_type_map[name.data()] = t;
-            return g_tdb_type_map[name.data()];
+        if (map_populated) {
+            return nullptr;
         }
     }
 
-    return g_tdb_type_map[name.data()];
+    {
+        std::unique_lock _{ g_tdb_type_mtx };
+
+        map_populated = true;
+
+        for (uint32_t i = 0; i < this->numTypes; ++i) {
+            auto t = get_type(i);
+
+            g_tdb_type_map[t->get_full_name()] = t;
+        }
+    }
+
+    return this->find_type(name);
 }
 
 sdk::RETypeDefinition* RETypeDB::find_type_by_fqn(uint32_t fqn) const {
@@ -134,7 +162,7 @@ void* find_native_method(std::string_view type_name, std::string_view method_nam
 sdk::RETypeDefinition* RETypeDB::get_type(uint32_t index) const {
     index &= get_type_bitmask();
 
-    if (index >= this->numTypes) {
+    if (index >= this->get_num_types()) {
         return nullptr;
     }
 
@@ -336,6 +364,12 @@ void* REField::get_data_raw(void* object, bool is_value_type) const {
 
     return nullptr;
 }
+
+uint32_t sdk::REField::get_index() const {
+    auto tdb = RETypeDB::get();
+
+    return (uint32_t)(((uintptr_t)this - (uintptr_t)tdb->fields) / sizeof(sdk::REField));
+}
 } // namespace sdk
 
 // methods
@@ -391,6 +425,9 @@ const char* REMethodDefinition::get_name() const {
     return tdb->get_string(name_offset);
 }
 
+std::unordered_set<REMethodDefinition*> logged_encoded_0_methods{};
+std::shared_mutex logged_encoded_0_methods_mtx{};
+
 void* REMethodDefinition::get_function() const {
 #if TDB_VER >= 71
     if (this->encoded_offset == 0) {
@@ -415,6 +452,17 @@ void* REMethodDefinition::get_function() const {
             }
         }*/
 
+        {
+            std::shared_lock _{ logged_encoded_0_methods_mtx };
+
+            if (logged_encoded_0_methods.contains(const_cast<REMethodDefinition*>(this))) {
+                return nullptr;
+            }
+        }
+
+        std::unique_lock _{ logged_encoded_0_methods_mtx };
+        logged_encoded_0_methods.insert(const_cast<REMethodDefinition*>(this));
+
         auto decl_type = this->get_declaring_type();
         auto name = decl_type != nullptr ? decl_type->get_full_name() : std::string{"null"};
         spdlog::error("[REMethodDefinition::get_function] Encoded offset is 0 (vindex {}) (method: {}.{})", this->get_virtual_index(), name, this->get_name());
@@ -424,13 +472,62 @@ void* REMethodDefinition::get_function() const {
     // The function this function uses to offset from has a predictable pattern as well.
     // So the pattern for that can be searched for if this one breaks.
     // It remains to be seen if this "encoding" is used in games other than MHRise.
+    static uintptr_t encoded_function_base = [&]() -> uintptr_t {
+        const auto game = utility::get_executable();
+        const auto invoke_table = sdk::VM::get_invoke_table();
+
+        if (invoke_table == nullptr) {
+            spdlog::error("[REMethodDefinition] Failed to find invoke table, cannot find encoded_function_base");
+            return 0;
+        }
+
+        const auto first_fn = invoke_table[1];
+
+        if (first_fn == nullptr) {
+            spdlog::error("[REMethodDefinition] Failed to find first function in invoke table, cannot find encoded_function_base");
+            return 0;
+        }
+
+        uintptr_t result = 0;
+
+        utility::exhaustive_decode((uint8_t*)first_fn, 100, [&](utility::ExhaustionContext& ctx) -> utility::ExhaustionResult {
+            if (result != 0) {
+                return utility::ExhaustionResult::BREAK;
+            }
+
+            if (std::string_view{ctx.instrux.Mnemonic} != "LEA") {
+                return utility::ExhaustionResult::CONTINUE;
+            }
+
+            const auto disp = utility::resolve_displacement(ctx.addr);
+
+            if (!disp) {
+                return utility::ExhaustionResult::CONTINUE;
+            }
+
+            if (utility::get_module_within(*disp).value_or(nullptr) != game) {
+                return utility::ExhaustionResult::CONTINUE;
+            }
+
+            result = *disp;
+            return utility::ExhaustionResult::BREAK;
+        });
+
+        spdlog::info("[REMethodDefinition] Found encoded_function_base at {:x}", result);
+
+        return result;
+    }();
+
     static void* (*get_encoded_pointer)(int32_t offset) = []() {
         spdlog::info("[REMethodDefinition] Finding get_encoded_pointer");
 
         auto fn = utility::scan(utility::get_executable(), "85 C9 75 03 33 C0 C3 48 63 C1 48 8d 0D ? ? ? ? 48 03 C1 C3");
 
+        // Alternative scan where we find the first LEA instruction that loads a pointer to a function basically
+        // inside the invoke table.
         if (!fn) {
             spdlog::error("[REMethodDefinition] Failed to find get_encoded_pointer");
+
             return (void* (*)(int32_t))nullptr;
         }
 
@@ -440,6 +537,10 @@ void* REMethodDefinition::get_function() const {
     }();
 
     if (get_encoded_pointer == nullptr) {
+        if (encoded_function_base != 0) {
+            return (void*)(encoded_function_base + this->encoded_offset);
+        }
+
         return nullptr;
     }
 
@@ -477,13 +578,22 @@ uint32_t sdk::REMethodDefinition::get_invoke_id() const {
     return invoke_id;
 }
 
-reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::vector<void*>& args) const {
+reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::span<void*>& args) const {
+    ::reframework::InvokeRet out{};
+    invoke(object, args, out);
+
+    return out;
+}
+
+void sdk::REMethodDefinition::invoke(void* object, const std::span<void*>& args, ::reframework::InvokeRet& out) const {
     const auto num_params = get_num_params();
 
     if (num_params != args.size()) {
         //throw std::runtime_error("Invalid number of arguments");
-        spdlog::warn("Invalid number of arguments passed to REMethodDefinition::invoke for {}", get_name());
-        return reframework::InvokeRet{};
+        const auto declaring_type = get_declaring_type();
+        const auto decltype_name = declaring_type != nullptr ? declaring_type->get_full_name() : "unknownclass";
+        spdlog::warn("Invalid number of arguments passed to REMethodDefinition::invoke for {}.{}", decltype_name, get_name());
+        return;
     }
 
 #if TDB_VER > 49
@@ -498,8 +608,6 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
         void* out_data; //0x0038 can be whatever, can be a dword, can point to data
         void* object_ptr; //0x0040 aka "this" pointer
     };
-
-    reframework::InvokeRet out{};
 
     StackFrame stack_frame{};
     stack_frame.method = this;
@@ -536,7 +644,9 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
 
             // exception pointer
             if (context->unkPtr->unkPtr != nullptr) {
-                spdlog::error("Internal game exception thrown in REMethodDefinition::invoke for {}", get_name());
+                const auto declaring_type = get_declaring_type();
+                const auto decltype_name = declaring_type != nullptr ? declaring_type->get_full_name() : "unknownclass";
+                spdlog::error("Internal game exception thrown in REMethodDefinition::invoke for {}.{}", decltype_name, get_name());
 
                 const auto exception_managed_object = (::REManagedObject*)context->unkPtr->unkPtr;
 
@@ -558,7 +668,10 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
                 context->unkPtr->unkPtr = nullptr;
             }
         } catch (sdk::VMContext::Exception&) {
-            spdlog::error("Exception thrown in REMethodDefinition::invoke for {}", get_name());
+            const auto declaring_type = get_declaring_type();
+            const auto decltype_name = declaring_type != nullptr ? declaring_type->get_full_name() : "unknownclass";
+
+            spdlog::error("Exception thrown in REMethodDefinition::invoke for {}.{}", decltype_name, get_name());
             context->cleanup_after_exception(scoped_translator.get_prev_reference_count());
             
             memset(&out, 0, sizeof(out));
@@ -569,28 +682,28 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
 
             out.exception_thrown = true;
 
-            return out;
+            return;
         }
     }
 
     if (stack_frame.out_data != &out) {
         out.ptr = stack_frame.out_data;
-        return out;
+        return;
     }
 
-    return out;
+    return;
 #else
     // RE7 doesn't have the invoke wrappers that the newer games use...
     if (num_params > 3) {
         spdlog::warn("REMethodDefinition::invoke for {} has more than 2 parameters, which is not supported at this time (RE7)", get_name());
-        return reframework::InvokeRet{};
+        return;
     }
 
     const bool is_static = this->is_static();
 
     if (!is_static && object == nullptr) {
         spdlog::warn("REMethodDefinition::invoke for {} is not static, but object is nullptr", get_name());
-        return reframework::InvokeRet{};
+        return;
     }
 
     auto ret_ty = get_return_type();
@@ -608,8 +721,6 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
     } else {
         is_ptr = true;
     }
-
-    reframework::InvokeRet out{};
 
     const auto param_types = get_param_types();
     std::vector<size_t> param_hashes{};
@@ -697,7 +808,7 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
     switch (num_params) {
     case 0:
         unpack_and_call();
-        return out;
+        return;
 
         break;
     case 1:
@@ -710,7 +821,7 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
             unpack_and_call.operator()<void*>();
         }
 
-        return out;
+        return;
 
         break;
     case 2:
@@ -735,7 +846,7 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
             unpack_and_call.operator()<void*, void*>();
         }
 
-        return out;
+        return;
 
         break;
     case 3:
@@ -879,7 +990,7 @@ reframework::InvokeRet sdk::REMethodDefinition::invoke(void* object, const std::
         break;
     }
 
-    return out;
+    return;
 #endif
 }
 
@@ -1055,5 +1166,40 @@ std::vector<const char*> REMethodDefinition::get_param_names() const {
     
     return out;
 #endif
+}
+
+const char* REModule::get_assembly_name() const {
+    auto tdb = RETypeDB::get();
+    return tdb->get_string(this->assembly_name_offset);
+}
+
+const char* REModule::get_location() const {
+    auto tdb = RETypeDB::get();
+    return tdb->get_string(this->location_offset);
+}
+
+const char* REModule::get_module_name() const {
+    auto tdb = RETypeDB::get();
+    return tdb->get_string(this->module_name_offset);
+}
+
+std::span<uint32_t> REModule::get_types() const {
+    auto tdb = RETypeDB::get();
+    return std::span<uint32_t>{(uint32_t*)tdb->get_bytes(this->types_start), (size_t)this->types_count};
+}
+
+std::span<uint32_t> REModule::get_methods() const {
+    auto tdb = RETypeDB::get();
+    return std::span<uint32_t>{(uint32_t*)tdb->get_bytes(this->methods_start), (size_t)this->methods_count};
+}
+
+std::span<uint32_t> REModule::get_instantiated_methods() const {
+    auto tdb = RETypeDB::get();
+    return std::span<uint32_t>{(uint32_t*)tdb->get_bytes(this->method_instantiations_start), (size_t)this->method_instantiations_count};
+}
+
+std::span<uint32_t> REModule::get_member_references() const {
+    auto tdb = RETypeDB::get();
+    return std::span<uint32_t>{(uint32_t*)tdb->get_bytes(this->member_references_start), (size_t)this->member_references_count};
 }
 } // namespace sdk
